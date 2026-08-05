@@ -44,7 +44,7 @@ pub struct VarlinkEvent {
 pub struct KdeConnectVarlinkService {
     event_sender: Arc<mpsc::UnboundedSender<AppEvent>>,
     devices: Arc<tokio::sync::Mutex<std::collections::HashMap<String, DbusDevice>>>,
-    sms_cache: Arc<tokio::sync::Mutex<Option<String>>>,
+    sms_cache: Arc<tokio::sync::Mutex<Option<Arc<str>>>>,
     clipboard: Option<ClipboardHandle>,
     broadcast_tx: broadcast::Sender<VarlinkEvent>,
 }
@@ -53,7 +53,7 @@ impl KdeConnectVarlinkService {
     pub fn new(
         event_sender: Arc<mpsc::UnboundedSender<AppEvent>>,
         devices: Arc<tokio::sync::Mutex<std::collections::HashMap<String, DbusDevice>>>,
-        sms_cache: Arc<tokio::sync::Mutex<Option<String>>>,
+        sms_cache: Arc<tokio::sync::Mutex<Option<Arc<str>>>>,
         clipboard: Option<ClipboardHandle>,
         broadcast_tx: broadcast::Sender<VarlinkEvent>,
     ) -> Self {
@@ -270,7 +270,7 @@ impl VarlinkInterface for KdeConnectVarlinkService {
 
     async fn get_cached_sms(&self, call: &mut dyn Call_GetCachedSms, device_id: String) -> varlink::Result<()> {
         if let Some(json) = self.sms_cache.lock().await.as_ref() {
-            return call.reply(json.clone());
+            return call.reply(json.to_string());
         }
         call.reply(crate::dbus_interface::load_sms_cache(&device_id).await.unwrap_or_default())
     }
@@ -349,7 +349,7 @@ impl VarlinkInterface for KdeConnectVarlinkService {
 pub async fn run_varlink_server(
     event_sender: Arc<mpsc::UnboundedSender<AppEvent>>,
     devices: Arc<tokio::sync::Mutex<std::collections::HashMap<String, DbusDevice>>>,
-    sms_cache: Arc<tokio::sync::Mutex<Option<String>>>,
+    sms_cache: Arc<tokio::sync::Mutex<Option<Arc<str>>>>,
     clipboard: Option<ClipboardHandle>,
     broadcast_tx: broadcast::Sender<VarlinkEvent>,
 ) -> Result<()> {

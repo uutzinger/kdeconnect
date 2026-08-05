@@ -34,8 +34,8 @@ pub enum Message {
     },
 
     // Battery and connectivity updates — patch device in place without full refresh
-    BatteryUpdated(String, i32, bool),  // device_id, level, is_charging
-    ConnectivityUpdated(String, i32),   // device_id, signal_strength
+    BatteryUpdated(String, i32, bool), // device_id, level, is_charging
+    ConnectivityUpdated(String, i32),  // device_id, signal_strength
 
     // Advanced features
     RemoteInput(String),
@@ -62,9 +62,9 @@ pub enum Message {
     MprisPrevious(String),                                     // bus_name
 
     // Run Command
-    RequestRunCommands(String),              // device_id
-    RunCommandsReceived(String, String),     // device_id, commands_json
-    ExecuteRunCommand(String, String),       // device_id, key
+    RequestRunCommands(String),          // device_id
+    RunCommandsReceived(String, String), // device_id, commands_json
+    ExecuteRunCommand(String, String),   // device_id, key
 
     // SMS unread indicator for the quick-actions menu — device_id -> has_unread
     UnreadSmsUpdated(HashMap<String, bool>),

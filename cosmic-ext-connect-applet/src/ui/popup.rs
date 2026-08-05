@@ -1,10 +1,9 @@
-
 use crate::messages::Message;
 use crate::models::{Device, NowPlaying};
 use cosmic::app::Core;
 use cosmic::iced::{Alignment, Length};
 use cosmic::widget::Row;
-use cosmic::{widget, Element};
+use cosmic::{Element, widget};
 use std::collections::HashMap;
 
 /// Build the popup view using the real application Core so popup_container
@@ -241,7 +240,8 @@ fn create_device_card<'a>(
     if is_expanded && is_online {
         let mut menu_items = widget::Column::new().spacing(spacing.space_xxs);
 
-        let mut quick_actions_list = widget::list_column().style(cosmic::theme::Container::Transparent);
+        let mut quick_actions_list =
+            widget::list_column().style(cosmic::theme::Container::Transparent);
 
         quick_actions_list =
             quick_actions_list.add(widget::text::caption_heading(fl!("quick-actions-header")));
@@ -370,10 +370,7 @@ fn create_device_card<'a>(
 
         menu_items = menu_items.push(quick_actions_list);
 
-        col = col.push(
-            widget::container(menu_items)
-                .padding([spacing.space_xs, spacing.space_m])
-        );
+        col = col.push(widget::container(menu_items).padding([spacing.space_xs, spacing.space_m]));
     } else if is_expanded && !is_online {
         col = col.push(
             widget::container(widget::text(fl!("devices-not-reachable")).size(12))

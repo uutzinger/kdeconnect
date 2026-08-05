@@ -1,14 +1,14 @@
 //! UI view implementations for the SMS window.
 
+use cosmic::Element;
 use cosmic::iced::{Alignment, Length};
 use cosmic::widget;
-use cosmic::Element;
 
 use super::actions::SmsMessage;
 use super::app::SmsWindow;
-use super::emoji::{is_emoji_char, EmojiCategory};
+use super::emoji::{EmojiCategory, is_emoji_char};
 use super::models::Conversation;
-use super::utils::{format_timestamp, normalize_phone_number, phone_numbers_match};
+use super::utils::{format_timestamp, normalize_phone_number};
 
 /// Max characters shown in the conversation-list preview before truncating
 /// with an ellipsis, so every row takes up the same amount of space
@@ -120,14 +120,8 @@ fn view_conversations_list<'a>(
 ) -> Element<'a, SmsMessage> {
     let mut content = widget::Column::new().spacing(spacing.space_xs);
 
-    let contacts_by_name = app
-        .contacts
-        .iter()
-        .map(|(_p, name)| name.to_string())
-        .collect::<Vec<String>>();
-
     let contacts_dropdown = widget::dropdown(
-        contacts_by_name,
+        &app.contacts_by_name,
         app.contact_idx,
         SmsMessage::SelectContactForNewChat,
     )
@@ -174,15 +168,13 @@ fn view_conversations_list<'a>(
     );
     content = content.push(widget::divider::horizontal::default());
 
-    // Filter conversations
-    let mut filtered: Vec<_> = app
+    // Filter conversations. The source vector is already kept sorted by
+    // timestamp in `app.rs`, so no need to re-sort here.
+    let filtered: Vec<_> = app
         .conversations
         .iter()
         .filter(|c| conversation_matches_search(app, c))
         .collect();
-
-    // Sort by timestamp (most recent first)
-    filtered.sort_by(|a, b| b.timestamp.cmp(&a.timestamp));
 
     if filtered.is_empty() {
         let msg = if app.search_query.is_empty() {
@@ -221,12 +213,13 @@ fn view_conversations_list<'a>(
 }
 
 fn conversation_matches_search(app: &SmsWindow, conv: &Conversation) -> bool {
-    if app.search_query.is_empty() {
+    if app.search_query_lower.is_empty() {
         return true;
     }
 
-    let query = app.search_query.to_lowercase();
-    conv.contact_name.to_lowercase().contains(&query)
+    conv.contact_name
+        .to_lowercase()
+        .contains(&app.search_query_lower)
         || conv.phone_number.contains(&app.search_query)
         || normalize_phone_number(&conv.phone_number)
             .contains(&normalize_phone_number(&app.search_query))
@@ -400,7 +393,25 @@ fn view_messages_list<'a>(
             .padding(spacing.space_xl),
         );
     } else {
-        for msg in &app.messages {
+        let total = app.messages.len();
+        let hidden = total.saturating_sub(app.messages_window_size);
+
+        // If there are older messages not currently rendered, show a control
+        // to load more. This keeps long threads responsive by avoiding a full
+        // rebuild of the entire history on every keystroke.
+        if hidden > 0 {
+            messages_column = messages_column.push(
+                widget::container(
+                    widget::button::standard(fl!("sms-load-more-messages"))
+                        .on_press(SmsMessage::LoadMoreMessages)
+                        .width(Length::Fill),
+                )
+                .width(Length::Fill)
+                .center_x(Length::Fill),
+            );
+        }
+
+        for msg in app.messages.iter().take(app.messages_window_size) {
             messages_column = messages_column.push(view_message_bubble(app, msg, spacing));
         }
     }
@@ -718,20 +729,17 @@ fn view_emoji_picker<'a>(
 // Helper functions
 
 fn get_contact_name(app: &SmsWindow, phone_number: &str) -> Option<String> {
-    app.contacts
-        .iter()
-        .find(|(contact_phone, _)| phone_numbers_match(phone_number, contact_phone))
-        .map(|(_, name)| name.clone())
+    app.contacts_by_phone
+        .get(&normalize_phone_number(phone_number))
+        .cloned()
 }
 
 fn get_contact_photo<'a>(
     app: &'a SmsWindow,
     phone_number: &str,
-) -> Option<&'a super::avatar::Avatar> {
-    app.contact_photos
-        .iter()
-        .find(|(contact_phone, _)| phone_numbers_match(phone_number, contact_phone))
-        .map(|(_, photo)| photo)
+) -> Option<&'a cosmic::widget::image::Handle> {
+    app.contact_photo_handles
+        .get(&normalize_phone_number(phone_number))
 }
 
 /// Avatar for a contact: their photo if we have one, otherwise a generic
@@ -744,18 +752,14 @@ fn get_contact_photo<'a>(
 /// rounded quad with no background/border to actually show is why the
 /// placeholder looked square before.
 fn view_contact_avatar<'a>(
-    photo: Option<&'a super::avatar::Avatar>,
+    photo: Option<&'a cosmic::widget::image::Handle>,
     size: f32,
 ) -> Element<'a, SmsMessage> {
-    if let Some(avatar) = photo {
-        return widget::image(cosmic::widget::image::Handle::from_rgba(
-            avatar.width,
-            avatar.height,
-            avatar.rgba.clone(),
-        ))
-        .width(Length::Fixed(size))
-        .height(Length::Fixed(size))
-        .into();
+    if let Some(handle) = photo {
+        return widget::image(handle.clone())
+            .width(Length::Fixed(size))
+            .height(Length::Fixed(size))
+            .into();
     }
 
     widget::container(

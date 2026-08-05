@@ -107,6 +107,7 @@ sms-select-conversation = Vyberte konverzaci pro zobrazení zpráv
 sms-conversation-not-found = Konverzace nenalezena
 sms-waiting-for-messages = Čekání na zprávy...
 sms-messages-will-appear = Zprávy se zobrazí, jakmile dorazí z vašeho telefonu
+sms-load-more-messages = Načíst starší zprávy
 sms-message-placeholder = Napište zprávu...
 sms-send = Odeslat
 

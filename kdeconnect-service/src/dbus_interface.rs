@@ -599,7 +599,7 @@ impl DaemonInterface {
 /// SMS-specific D-Bus interface
 pub struct SmsInterface {
     event_sender: Arc<mpsc::UnboundedSender<AppEvent>>,
-    sms_cache: Arc<Mutex<Option<String>>>,
+    sms_cache: Arc<Mutex<Option<Arc<str>>>>,
 }
 
 #[interface(name = "io.github.hepp3n.kdeconnect.Sms")]
@@ -608,7 +608,7 @@ impl SmsInterface {
     async fn get_cached_sms(&self, device_id: String) -> String {
         if let Some(json) = self.sms_cache.lock().await.as_ref() {
             debug!("Returning in-memory SMS cache ({} bytes)", json.len());
-            return json.clone();
+            return json.to_string();
         }
         match load_sms_cache(&device_id).await {
             Some(json) => json,
@@ -782,7 +782,7 @@ pub struct KdeConnectService {
     connection: Connection,
     event_sender: Arc<mpsc::UnboundedSender<AppEvent>>,
     devices: Arc<Mutex<HashMap<String, DbusDevice>>>,
-    sms_cache: Arc<Mutex<Option<String>>>,
+    sms_cache: Arc<Mutex<Option<Arc<str>>>>,
     clipboard: Option<ClipboardHandle>,
 }
 
@@ -922,7 +922,7 @@ impl KdeConnectService {
             .await?;
         info!("Daemon interface registered at {}", DAEMON_PATH);
 
-        let sms_cache: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
+        let sms_cache: Arc<Mutex<Option<Arc<str>>>> = Arc::new(Mutex::new(None));
         let current_device_id: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
 
         let sms_interface = SmsInterface {
@@ -1044,7 +1044,7 @@ impl KdeConnectService {
         event: ConnectionEvent,
         devices: &Arc<Mutex<HashMap<String, DbusDevice>>>,
         event_sender: &Arc<mpsc::UnboundedSender<AppEvent>>,
-        sms_cache: &Arc<Mutex<Option<String>>>,
+        sms_cache: &Arc<Mutex<Option<Arc<str>>>>,
         current_device_id: &Arc<Mutex<Option<String>>>,
         broadcast_tx: &broadcast::Sender<crate::varlink_server::VarlinkEvent>,
     ) -> Result<()> {
@@ -1118,7 +1118,7 @@ impl KdeConnectService {
 
                     if sms_cache.lock().await.is_none() {
                         if let Some(cached_sms) = load_sms_cache(&did).await {
-                            *sms_cache.lock().await = Some(cached_sms);
+                            *sms_cache.lock().await = Some(Arc::from(cached_sms));
                             debug!("Seeded in-memory SMS cache from disk on connect");
                         }
                     }
@@ -1299,7 +1299,7 @@ impl KdeConnectService {
                 let messages_json = serde_json::to_string(&sms_data)?;
                 debug!("SMS JSON size: {} bytes", messages_json.len());
 
-                *sms_cache.lock().await = Some(messages_json.clone());
+                *sms_cache.lock().await = Some(Arc::from(messages_json.as_str()));
 
                 if let Some(did) = current_device_id.lock().await.as_deref() {
                     save_sms_cache(did, &messages_json).await;

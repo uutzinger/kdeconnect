@@ -72,7 +72,11 @@ impl Message {
 /// Events received from the native protocol adapter.
 #[derive(Debug, Clone)]
 pub enum ProtocolEvent {
+    /// Single live message (e.g. a real-time push from the phone).
     MessageReceived(Message),
+    /// Bulk messages, typically the initial cache or a full thread sync.
+    /// Processed in one batch to avoid O(n²) per-message sorts.
+    MessagesReceived(Vec<Message>),
     ConversationsReceived(Vec<Conversation>),
     /// Used for error handling in event processing
     Error(String),

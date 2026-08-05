@@ -28,6 +28,8 @@ pub enum SmsMessage {
     /// so a large contact list with many photos can't stall the UI.
     AvatarsBaked(HashMap<String, Avatar>),
     SelectThread(String),
+    /// Increase the number of rendered messages in the current thread.
+    LoadMoreMessages,
     UpdateInput(String),
     UpdateSearch(String),
     SendMessage,
@@ -56,7 +58,10 @@ pub enum SmsMessage {
     ConfirmDeleteConversation,
 
     /// User tapped a thumbnail that hasn't been fully downloaded yet.
-    RequestFullAttachment { part_id: i64, unique_identifier: String },
+    RequestFullAttachment {
+        part_id: i64,
+        unique_identifier: String,
+    },
     /// A full-resolution attachment finished downloading. Payload is
     /// (filename/unique_identifier, saved path) — see
     /// `kdeconnect_dbus_client::ServiceEvent::SmsAttachmentReceived`.

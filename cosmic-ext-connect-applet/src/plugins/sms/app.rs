@@ -1,11 +1,11 @@
 use async_stream::stream;
+use cosmic::iced::widget::scrollable;
 use cosmic::{
     Action, Application, ApplicationExt, Element, Task,
     app::Core,
     iced::{Length, Subscription},
     widget,
 };
-use cosmic::iced::widget::scrollable;
 use futures::StreamExt;
 use std::collections::HashMap;
 use tracing::{debug, error, info, warn};
@@ -18,23 +18,37 @@ use super::models::{Conversation, Message, MessageAttachment, ProtocolEvent};
 use super::utils;
 use super::views;
 
+/// Number of messages rendered initially in a thread. Older messages are
+/// loaded on demand so a long conversation doesn't degrade input latency.
+const INITIAL_MESSAGES_WINDOW: usize = 100;
+
 pub struct SmsWindow {
     core: Core,
     pub device_id: String,
     #[allow(dead_code)]
     pub device_name: String,
     pub conversations: Vec<Conversation>,
+    /// Sorted contact list used by the new-chat dropdown.
     pub contacts: Vec<(String, String)>,
-    /// Phone -> baked circular avatar, parsed from vcard PHOTO
-    /// properties. Missing entry (not an empty one) means "no photo
-    /// available, show the default placeholder" — see
-    /// `views::view_contact_avatar`.
-    pub contact_photos: HashMap<String, Avatar>,
+    /// Contact names in `contacts` order, cached for the dropdown widget so
+    /// it isn't rebuilt from `contacts` on every render.
+    pub contacts_by_name: Vec<String>,
+    /// Phone-number -> name map for O(1) contact lookups in the view.
+    pub contacts_by_phone: HashMap<String, String>,
+    /// Pre-built image handles for contact photos so the RGBA buffer isn't
+    /// cloned on every frame.
+    pub contact_photo_handles: HashMap<String, cosmic::widget::image::Handle>,
     pub selected_thread: Option<String>,
     pub contact_idx: Option<usize>,
     pub messages: Vec<Message>,
+    /// How many of the most recent messages in `messages` are currently
+    /// rendered. Increases when the user asks to load older messages.
+    pub messages_window_size: usize,
     pub message_input: String,
     pub search_query: String,
+    /// Lowercased copy of `search_query` so the view doesn't reallocate it
+    /// on every frame.
+    pub search_query_lower: String,
     pub show_new_chat_dialog: bool,
     pub new_chat_phone_input: String,
     pub show_emoji_picker: bool,
@@ -79,12 +93,16 @@ impl Application for SmsWindow {
             device_name: device_name.clone(),
             conversations: Vec::new(),
             contacts: Vec::new(),
-            contact_photos: HashMap::new(),
+            contacts_by_name: Vec::new(),
+            contacts_by_phone: HashMap::new(),
+            contact_photo_handles: HashMap::new(),
             selected_thread: None,
-	    contact_idx: Some(0),
+            contact_idx: Some(0),
             messages: Vec::new(),
+            messages_window_size: INITIAL_MESSAGES_WINDOW,
             message_input: String::new(),
             search_query: String::new(),
+            search_query_lower: String::new(),
             show_new_chat_dialog: false,
             new_chat_phone_input: String::new(),
             show_emoji_picker: false,
@@ -98,10 +116,7 @@ impl Application for SmsWindow {
         let title = fl!("sms-window-title", device = device_name.as_str());
         app.core.window.header_title = title.clone().into();
 
-        let title_task = app.set_window_title(
-            title,
-            app.core.main_window_id().unwrap(),
-        );
+        let title_task = app.set_window_title(title, app.core.main_window_id().unwrap());
 
         (app, title_task)
     }
@@ -123,108 +138,104 @@ impl Application for SmsWindow {
             cosmic::iced::time::every(std::time::Duration::from_secs(45))
                 .map(|_| SmsMessage::LoadConversations),
             Subscription::run_with(device_id, |device_id| {
-            let device_id = device_id.clone();
-            stream! {
-                info!("SMS event stream started for device={}", device_id);
+                let device_id = device_id.clone();
+                stream! {
+                    info!("SMS event stream started for device={}", device_id);
 
-                if let Err(e) = dbus::initialize().await {
-                    error!("SMS D-Bus init failed: {:?}", e);
-                    std::future::pending::<()>().await;
-                    return;
-                }
-
-                let Some(client) = dbus::get_client().await else {
-                    warn!("SMS D-Bus no client available, stream idle");
-                    std::future::pending::<()>().await;
-                    return;
-                };
-
-                debug!("SMS event loop entering");
-
-                let cached_contacts = dbus::get_cached_contacts(&device_id).await;
-                if !cached_contacts.is_empty() {
-                    debug!("yielding {} cached contacts at startup", cached_contacts.len());
-                    yield SmsMessage::ContactsLoaded(cached_contacts);
-                }
-
-                let cached_photos = dbus::get_cached_contact_photos(&device_id).await;
-                if !cached_photos.is_empty() {
-                    debug!("yielding {} cached contact photos at startup", cached_photos.len());
-                    yield SmsMessage::ContactPhotosLoaded(cached_photos);
-                }
-
-                if let Some(cached_json) = dbus::get_cached_sms(&device_id).await {
-                    debug!("yielding cached SMS at startup");
-                    let (messages, conversations) = dbus::parse_sms_messages(&cached_json);
-                    for msg in messages {
-                        yield SmsMessage::ProtocolEventReceived(ProtocolEvent::MessageReceived(msg));
+                    if let Err(e) = dbus::initialize().await {
+                        error!("SMS D-Bus init failed: {:?}", e);
+                        std::future::pending::<()>().await;
+                        return;
                     }
-                    yield SmsMessage::ProtocolEventReceived(ProtocolEvent::ConversationsReceived(conversations));
-                }
 
-                loop {
-                    debug!("SMS subscribing to events");
-                    let mut event_stream = match client.listen_for_events().await {
-                        Ok(s) => s,
-                        Err(e) => {
-                            warn!("Failed to subscribe to SMS event stream: {:?}", e);
-                            tokio::time::sleep(tokio::time::Duration::from_secs(1)).await;
-                            continue;
-                        }
+                    let Some(client) = dbus::get_client().await else {
+                        warn!("SMS D-Bus no client available, stream idle");
+                        std::future::pending::<()>().await;
+                        return;
                     };
 
-                    // Subscribe FIRST, then request — contacts response is a
-                    // fire-and-forget D-Bus signal; if we request before subscribing
-                    // the signal arrives while nobody is listening and is lost.
-                    tokio::time::sleep(tokio::time::Duration::from_millis(300)).await;
-                    dbus::fetch_conversations(&device_id).await;
-                    dbus::fetch_contacts(&device_id).await;
+                    debug!("SMS event loop entering");
 
-                    while let Some(event) = event_stream.next().await {
-                        use kdeconnect_dbus_client::ServiceEvent;
-                        match event {
-                            ServiceEvent::SmsMessagesReceived(json) => {
-                                debug!("SmsMessagesReceived len={}", json.len());
-                                let (messages, conversations) = dbus::parse_sms_messages(&json);
-                                for msg in messages {
-                                    yield SmsMessage::ProtocolEventReceived(
-                                        ProtocolEvent::MessageReceived(msg)
-                                    );
-                                }
-                                yield SmsMessage::ProtocolEventReceived(
-                                    ProtocolEvent::ConversationsReceived(conversations)
-                                );
-                            }
-                            ServiceEvent::ContactsReceived(contacts) => {
-                                debug!("ContactsReceived {} entries", contacts.len());
-                                yield SmsMessage::ContactsLoaded(contacts);
-                            }
-                            ServiceEvent::SmsAttachmentReceived(filename, path) => {
-                                debug!("SmsAttachmentReceived {} -> {}", filename, path);
-                                yield SmsMessage::AttachmentReceived(filename, path.into());
-                            }
-                            ServiceEvent::ContactPhotosReceived(photos) => {
-                                debug!("ContactPhotosReceived {} entries", photos.len());
-                                let decoded: HashMap<String, Vec<u8>> = photos
-                                    .into_iter()
-                                    .filter_map(|(phone, b64)| {
-                                        kdeconnect_core::contacts::decode_photo(&b64)
-                                            .map(|bytes| (phone, bytes))
-                                    })
-                                    .collect();
-                                if !decoded.is_empty() {
-                                    yield SmsMessage::ContactPhotosLoaded(decoded);
-                                }
-                            }
-                            _ => {}
-                        }
+                    let cached_contacts = dbus::get_cached_contacts(&device_id).await;
+                    if !cached_contacts.is_empty() {
+                        debug!("yielding {} cached contacts at startup", cached_contacts.len());
+                        yield SmsMessage::ContactsLoaded(cached_contacts);
                     }
 
-                    warn!("SMS event stream ended, reconnecting in 1s");
-                    tokio::time::sleep(tokio::time::Duration::from_secs(1)).await;
+                    let cached_photos = dbus::get_cached_contact_photos(&device_id).await;
+                    if !cached_photos.is_empty() {
+                        debug!("yielding {} cached contact photos at startup", cached_photos.len());
+                        yield SmsMessage::ContactPhotosLoaded(cached_photos);
+                    }
+
+                    if let Some(cached_json) = dbus::get_cached_sms(&device_id).await {
+                        debug!("yielding cached SMS at startup");
+                        let (messages, conversations) = dbus::parse_sms_messages(&cached_json);
+                        yield SmsMessage::ProtocolEventReceived(ProtocolEvent::MessagesReceived(messages));
+                        yield SmsMessage::ProtocolEventReceived(ProtocolEvent::ConversationsReceived(conversations));
+                    }
+
+                    loop {
+                        debug!("SMS subscribing to events");
+                        let mut event_stream = match client.listen_for_events().await {
+                            Ok(s) => s,
+                            Err(e) => {
+                                warn!("Failed to subscribe to SMS event stream: {:?}", e);
+                                tokio::time::sleep(tokio::time::Duration::from_secs(1)).await;
+                                continue;
+                            }
+                        };
+
+                        // Subscribe FIRST, then request — contacts response is a
+                        // fire-and-forget D-Bus signal; if we request before subscribing
+                        // the signal arrives while nobody is listening and is lost.
+                        tokio::time::sleep(tokio::time::Duration::from_millis(300)).await;
+                        dbus::fetch_conversations(&device_id).await;
+                        dbus::fetch_contacts(&device_id).await;
+
+                        while let Some(event) = event_stream.next().await {
+                            use kdeconnect_dbus_client::ServiceEvent;
+                            match event {
+                                ServiceEvent::SmsMessagesReceived(json) => {
+                                    debug!("SmsMessagesReceived len={}", json.len());
+                                    let (messages, conversations) = dbus::parse_sms_messages(&json);
+                                    yield SmsMessage::ProtocolEventReceived(
+                                        ProtocolEvent::MessagesReceived(messages)
+                                    );
+                                    yield SmsMessage::ProtocolEventReceived(
+                                        ProtocolEvent::ConversationsReceived(conversations)
+                                    );
+                                }
+                                ServiceEvent::ContactsReceived(contacts) => {
+                                    debug!("ContactsReceived {} entries", contacts.len());
+                                    yield SmsMessage::ContactsLoaded(contacts);
+                                }
+                                ServiceEvent::SmsAttachmentReceived(filename, path) => {
+                                    debug!("SmsAttachmentReceived {} -> {}", filename, path);
+                                    yield SmsMessage::AttachmentReceived(filename, path.into());
+                                }
+                                ServiceEvent::ContactPhotosReceived(photos) => {
+                                    debug!("ContactPhotosReceived {} entries", photos.len());
+                                    let decoded: HashMap<String, Vec<u8>> = photos
+                                        .into_iter()
+                                        .filter_map(|(phone, b64)| {
+                                            kdeconnect_core::contacts::decode_photo(&b64)
+                                                .map(|bytes| (phone, bytes))
+                                        })
+                                        .collect();
+                                    if !decoded.is_empty() {
+                                        yield SmsMessage::ContactPhotosLoaded(decoded);
+                                    }
+                                }
+                                _ => {}
+                            }
+                        }
+
+                        warn!("SMS event stream ended, reconnecting in 1s");
+                        tokio::time::sleep(tokio::time::Duration::from_secs(1)).await;
+                    }
                 }
-            }
-        }),
+            }),
         ])
     }
 
@@ -244,12 +255,20 @@ impl Application for SmsWindow {
             }
             SmsMessage::ContactsLoaded(contacts) => {
                 debug!("ContactsLoaded: {} contacts", contacts.len());
-		let sorted = utils::sort_cached_contacts(contacts);
+                let sorted = utils::sort_cached_contacts(contacts.clone());
+                self.contacts_by_name = sorted.iter().map(|(_, name)| name.clone()).collect();
                 self.contacts = sorted;
+                self.contacts_by_phone = contacts
+                    .into_iter()
+                    .map(|(phone, name)| (utils::normalize_phone_number(&phone), name))
+                    .collect();
                 self.update_conversation_names();
             }
             SmsMessage::ContactPhotosLoaded(photos) => {
-                debug!("ContactPhotosLoaded: {} photos, baking off the UI thread", photos.len());
+                debug!(
+                    "ContactPhotosLoaded: {} photos, baking off the UI thread",
+                    photos.len()
+                );
                 return cosmic::task::future(async move {
                     let baked = tokio::task::spawn_blocking(move || {
                         photos
@@ -269,9 +288,19 @@ impl Application for SmsWindow {
             }
             SmsMessage::AvatarsBaked(baked) => {
                 debug!("AvatarsBaked: {} avatars", baked.len());
-                self.contact_photos.extend(baked);
+                for (phone, avatar) in baked {
+                    let handle = cosmic::widget::image::Handle::from_rgba(
+                        avatar.width,
+                        avatar.height,
+                        avatar.rgba,
+                    );
+                    self.contact_photo_handles.insert(phone, handle);
+                }
             }
-            SmsMessage::RequestFullAttachment { part_id, unique_identifier } => {
+            SmsMessage::RequestFullAttachment {
+                part_id,
+                unique_identifier,
+            } => {
                 debug!("RequestFullAttachment part_id={}", part_id);
                 let device_id = self.device_id.clone();
                 return cosmic::task::future(async move {
@@ -307,7 +336,8 @@ impl Application for SmsWindow {
                         .unwrap_or_else(|| "attachment".to_string());
 
                     let Some(dest) =
-                        crate::portal::save_file(fl!("sms-save-attachment-title"), suggested_name).await
+                        crate::portal::save_file(fl!("sms-save-attachment-title"), suggested_name)
+                            .await
                     else {
                         debug!("save attachment cancelled");
                         return Action::None;
@@ -343,8 +373,8 @@ impl Application for SmsWindow {
             }
             SmsMessage::PickAttachment => {
                 return cosmic::task::future(async move {
-                    let paths = crate::portal::pick_files(fl!("sms-attach-picker-title"), true, None)
-                        .await;
+                    let paths =
+                        crate::portal::pick_files(fl!("sms-attach-picker-title"), true, None).await;
                     Action::App(SmsMessage::AttachmentsPicked(paths))
                 });
             }
@@ -360,10 +390,12 @@ impl Application for SmsWindow {
             SmsMessage::SelectThread(thread_id) => {
                 debug!("SelectThread: {}", thread_id);
                 if let Some(conv) = self.conversations.iter().find(|c| c.thread_id == thread_id) {
-                    self.last_seen_timestamp.insert(thread_id.clone(), conv.timestamp);
+                    self.last_seen_timestamp
+                        .insert(thread_id.clone(), conv.timestamp);
                 }
                 self.selected_thread = Some(thread_id.clone());
                 self.messages.clear();
+                self.messages_window_size = INITIAL_MESSAGES_WINDOW;
                 let device_id = self.device_id.clone();
                 let device_id2 = device_id.clone();
                 let last_seen = self.last_seen_timestamp.clone();
@@ -373,15 +405,22 @@ impl Application for SmsWindow {
                         Action::App(SmsMessage::RefreshThread)
                     }),
                     cosmic::task::future(async move {
-                        kdeconnect_core::sms_read_state::save_last_seen(&device_id2, &last_seen).await;
+                        kdeconnect_core::sms_read_state::save_last_seen(&device_id2, &last_seen)
+                            .await;
                         Action::None
                     }),
                 ]);
+            }
+            SmsMessage::LoadMoreMessages => {
+                self.messages_window_size = self
+                    .messages_window_size
+                    .saturating_add(INITIAL_MESSAGES_WINDOW);
             }
             SmsMessage::UpdateInput(input) => {
                 self.message_input = input;
             }
             SmsMessage::UpdateSearch(query) => {
+                self.search_query_lower = query.to_lowercase();
                 self.search_query = query;
             }
             SmsMessage::SendMessage => {
@@ -436,16 +475,24 @@ impl Application for SmsWindow {
 
                 // Update the conversation preview and timestamp so it sorts to
                 // the top of the list immediately without waiting for a server refresh.
-                if let Some(conv) = self.conversations.iter_mut().find(|c| c.thread_id == thread_id) {
+                if let Some(conv) = self
+                    .conversations
+                    .iter_mut()
+                    .find(|c| c.thread_id == thread_id)
+                {
                     conv.last_message = text.clone();
                     conv.timestamp = now;
                 }
-                self.conversations.sort_by(|a, b| b.timestamp.cmp(&a.timestamp));
+                self.conversations
+                    .sort_by(|a, b| b.timestamp.cmp(&a.timestamp));
 
                 // Scroll the conversation list to the top so the moved item is visible.
                 let scroll_task = scrollable::scroll_to(
                     views::CONVERSATIONS_SCROLLABLE_ID.clone(),
-                    scrollable::AbsoluteOffset { x: Some(0.0), y: Some(0.0) },
+                    scrollable::AbsoluteOffset {
+                        x: Some(0.0),
+                        y: Some(0.0),
+                    },
                 );
 
                 return Task::batch(vec![
@@ -458,7 +505,10 @@ impl Application for SmsWindow {
             }
             SmsMessage::RefreshThread => {}
             SmsMessage::ProtocolEventReceived(event) => {
-                debug!("ProtocolEventReceived: {:?}", std::mem::discriminant(&event));
+                debug!(
+                    "ProtocolEventReceived: {:?}",
+                    std::mem::discriminant(&event)
+                );
                 self.handle_protocol_event(event);
             }
             SmsMessage::OpenNewChatDialog => {
@@ -472,8 +522,8 @@ impl Application for SmsWindow {
                 self.new_chat_phone_input = phone;
             }
             SmsMessage::SelectContactForNewChat(idx) => {
-		self.new_chat_phone_input = self.contacts[idx].0.clone();
-		self.contact_idx = Some(idx);
+                self.new_chat_phone_input = self.contacts[idx].0.clone();
+                self.contact_idx = Some(idx);
             }
             SmsMessage::CreateNewChat => {
                 let phone = self.new_chat_phone_input.trim().to_string();
@@ -536,7 +586,9 @@ impl Application for SmsWindow {
     }
 
     fn dialog(&self) -> Option<Element<'_, Self::Message>> {
-        self.pending_delete_thread.as_ref().map(|_| self.delete_confirm_dialog())
+        self.pending_delete_thread
+            .as_ref()
+            .map(|_| self.delete_confirm_dialog())
     }
 
     fn view(&self) -> Element<'_, Self::Message> {
@@ -544,7 +596,7 @@ impl Application for SmsWindow {
             .width(Length::Fill)
             .height(Length::Fill)
             .align_x(cosmic::iced::Alignment::Center)
-	    .into()
+            .into()
     }
 }
 
@@ -580,8 +632,15 @@ impl SmsWindow {
 
     fn handle_protocol_event(&mut self, event: ProtocolEvent) {
         match event {
+            ProtocolEvent::MessagesReceived(messages) => {
+                debug!("MessagesReceived: {} messages", messages.len());
+                self.handle_messages_received(messages);
+            }
             ProtocolEvent::ConversationsReceived(conversations) => {
-                debug!("ConversationsReceived: {} conversations", conversations.len());
+                debug!(
+                    "ConversationsReceived: {} conversations",
+                    conversations.len()
+                );
 
                 // Capture selected new_* phone BEFORE we mutate merged
                 let pending_new_phone: Option<String> = self
@@ -599,10 +658,7 @@ impl SmsWindow {
 
                     if let Some(pos) = merged.iter().position(|c| {
                         c.thread_id.starts_with("new_")
-                            && utils::phone_numbers_match(
-                                &c.phone_number,
-                                &incoming.phone_number,
-                            )
+                            && utils::phone_numbers_match(&c.phone_number, &incoming.phone_number)
                     }) {
                         merged[pos] = incoming.clone();
                     } else if let Some(existing) = merged
@@ -619,13 +675,14 @@ impl SmsWindow {
                     if !c.thread_id.starts_with("new_") {
                         return true;
                     }
-                    !conversations.iter().any(|r| {
-                        utils::phone_numbers_match(&r.phone_number, &c.phone_number)
-                    })
+                    !conversations
+                        .iter()
+                        .any(|r| utils::phone_numbers_match(&r.phone_number, &c.phone_number))
                 });
 
                 self.conversations = merged;
-                self.conversations.retain(|c| !self.hidden_conversations.contains(&c.thread_id));
+                self.conversations
+                    .retain(|c| !self.hidden_conversations.contains(&c.thread_id));
                 self.update_conversation_names();
 
                 // If we had a new_* selected, find its real thread by phone number now
@@ -640,74 +697,88 @@ impl SmsWindow {
             }
             ProtocolEvent::MessageReceived(message) => {
                 debug!("MessageReceived thread={}", message.thread_id);
-
-                if self.hidden_conversations.contains(&message.thread_id) {
-                    return;
-                }
-
-                let is_selected = self.selected_thread.as_deref() == Some(&message.thread_id);
-
-                if is_selected {
-                    let seen = self
-                        .last_seen_timestamp
-                        .entry(message.thread_id.clone())
-                        .or_insert(0);
-                    *seen = (*seen).max(message.date);
-
-                    let device_id = self.device_id.clone();
-                    let last_seen = self.last_seen_timestamp.clone();
-                    tokio::spawn(async move {
-                        kdeconnect_core::sms_read_state::save_last_seen(&device_id, &last_seen).await;
-                    });
-
-                    let already_exists = self.messages.iter().any(|m| {
-                        m.id == message.id
-                            || (m.id.starts_with("sending_")
-                                && m.type_ == 2
-                                && message.type_ == 2
-                                && m.body == message.body
-                                && (m.date - message.date).abs() < 300_000)
-                    });
-
-                    if !already_exists {
-                        self.messages.push(message.clone());
-                    } else {
-                        if let Some(existing) = self.messages.iter_mut().find(|m| {
-                            m.id.starts_with("sending_") && m.type_ == 2 && m.body == message.body
-                        }) {
-                            existing.id = message.id.clone();
-                            existing.thread_id = message.thread_id.clone();
-                            existing.date = message.date;
-                        }
-                    }
-                    self.messages.sort_by_key(|m| m.date);
-                }
-
-                if let Some(conv) = self
-                    .conversations
-                    .iter_mut()
-                    .find(|c| c.thread_id == message.thread_id)
-                {
-                    conv.last_message = message.body;
-                    conv.timestamp = message.date;
-                    if !is_selected && message.type_ != 2 {
-                        conv.unread = true;
-                    }
-                }
-                self.conversations
-                    .sort_by(|a, b| b.timestamp.cmp(&a.timestamp));
+                self.handle_messages_received(vec![message]);
             }
             ProtocolEvent::Error(e) => error!("SMS protocol error: {}", e),
         }
     }
 
+    /// Process a batch of messages in one pass. This is the hot path for the
+    /// initial SMS cache and full syncs; doing one sort at the end instead of
+    /// one per message avoids O(n²) behavior on long threads.
+    fn handle_messages_received(&mut self, messages: Vec<Message>) {
+        let selected = self.selected_thread.clone();
+        let is_selected = |thread_id: &str| selected.as_deref() == Some(thread_id);
+
+        for message in messages {
+            if self.hidden_conversations.contains(&message.thread_id) {
+                continue;
+            }
+
+            let selected_now = is_selected(&message.thread_id);
+
+            if selected_now {
+                let seen = self
+                    .last_seen_timestamp
+                    .entry(message.thread_id.clone())
+                    .or_insert(0);
+                *seen = (*seen).max(message.date);
+
+                let already_exists = self.messages.iter().any(|m| {
+                    m.id == message.id
+                        || (m.id.starts_with("sending_")
+                            && m.type_ == 2
+                            && message.type_ == 2
+                            && m.body == message.body
+                            && (m.date - message.date).abs() < 300_000)
+                });
+
+                if !already_exists {
+                    self.messages.push(message.clone());
+                } else if let Some(existing) = self.messages.iter_mut().find(|m| {
+                    m.id.starts_with("sending_") && m.type_ == 2 && m.body == message.body
+                }) {
+                    existing.id = message.id.clone();
+                    existing.thread_id = message.thread_id.clone();
+                    existing.date = message.date;
+                }
+            }
+
+            if let Some(conv) = self
+                .conversations
+                .iter_mut()
+                .find(|c| c.thread_id == message.thread_id)
+            {
+                conv.last_message = message.body.clone();
+                conv.timestamp = message.date;
+                if !selected_now && message.type_ != 2 {
+                    conv.unread = true;
+                }
+            }
+        }
+
+        // Sort affected collections once after the batch instead of after
+        // every individual message.
+        if is_selected(&selected.as_deref().unwrap_or_default()) && !self.messages.is_empty() {
+            self.messages.sort_by_key(|m| m.date);
+
+            // Persist the last-seen timestamp once for the whole batch.
+            let device_id = self.device_id.clone();
+            let last_seen = self.last_seen_timestamp.clone();
+            tokio::spawn(async move {
+                kdeconnect_core::sms_read_state::save_last_seen(&device_id, &last_seen).await;
+            });
+        }
+        self.conversations
+            .sort_by(|a, b| b.timestamp.cmp(&a.timestamp));
+    }
+
     fn update_conversation_names(&mut self) {
         for conv in &mut self.conversations {
             if let Some(name) = self
-                .contacts
-                .iter()
-                .find(|(phone, _)| utils::phone_numbers_match(phone, &conv.phone_number))
-                .map(|(_, name)| name.clone())
+                .contacts_by_phone
+                .get(&utils::normalize_phone_number(&conv.phone_number))
+                .cloned()
             {
                 conv.contact_name = name;
             }

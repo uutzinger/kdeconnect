@@ -153,9 +153,17 @@ impl RunCommandRequest {
                         .arg(&cmd.command)
                         .spawn()
                 };
-                if let Err(e) = result
-                {
-                    warn!("[runcommand] failed to spawn '{}': {}", cmd.name, e);
+                match result {
+                    Ok(mut child) => {
+                        // Reap the child on a blocking thread so it doesn't
+                        // become a zombie once it exits.
+                        tokio::task::spawn_blocking(move || {
+                            let _ = child.wait();
+                        });
+                    }
+                    Err(e) => {
+                        warn!("[runcommand] failed to spawn '{}': {}", cmd.name, e);
+                    }
                 }
             } else {
                 warn!(

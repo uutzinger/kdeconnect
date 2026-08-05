@@ -107,6 +107,7 @@ sms-select-conversation = Select a conversation to view messages
 sms-conversation-not-found = Conversation not found
 sms-waiting-for-messages = Waiting for messages...
 sms-messages-will-appear = Messages will appear as they arrive from your phone
+sms-load-more-messages = Load older messages
 sms-message-placeholder = Type a message...
 sms-send = Send
 

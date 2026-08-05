@@ -9,8 +9,8 @@ use models::{Device, NowPlaying};
 use cosmic::app::Core;
 use cosmic::iced::window::Id as SurfaceId;
 use cosmic::iced::{Limits, Subscription};
-use cosmic::{Element, Task, widget};
 use cosmic::surface::action::{app_popup, destroy_popup};
+use cosmic::{Element, Task, widget};
 use std::collections::HashMap;
 use tracing::{debug, error, info, warn};
 
@@ -46,9 +46,9 @@ impl cosmic::Application for KdeConnectApplet {
     }
 
     fn on_close_requested(&self, id: cosmic::iced::window::Id) -> Option<Self::Message> {
-	Some(Message::PopupClosed(id))
+        Some(Message::PopupClosed(id))
     }
-    
+
     fn init(core: Core, _flags: Self::Flags) -> (Self, Task<cosmic::Action<Self::Message>>) {
         tokio::spawn(async {
             if let Err(e) = backend::initialize().await {
@@ -69,38 +69,38 @@ impl cosmic::Application for KdeConnectApplet {
 
         (app, Task::none())
     }
-    
+
     fn update(&mut self, message: Self::Message) -> Task<cosmic::Action<Self::Message>> {
-	match message {
+        match message {
             Message::Noop => {}
             Message::TogglePopup => {
                 return if let Some(p) = self.popup.take() {
                     cosmic::surface::surface_task(destroy_popup(p))
                 } else {
-		    let show_popup = cosmic::surface::surface_task(app_popup(
-			|_| Default::default(),
-			|app: &mut KdeConnectApplet| {
-			    let new_id = cosmic::iced::window::Id::unique();
-			    
-			    app.popup.replace(new_id);
-			    
-			    let mut popup_settings = app.core.applet.get_popup_settings(
-				app.core.main_window_id().unwrap(),
-				new_id,
-				None,
-				None,
-				None,
-			    );
-			    popup_settings.positioner.size_limits = Limits::NONE
-				.max_width(400.0)
-				.min_width(300.0)
-				.min_height(200.0)
-				.max_height(600.0);
-			    popup_settings
-			},
-			None,
-		    ));
-		    
+                    let show_popup = cosmic::surface::surface_task(app_popup(
+                        |_| Default::default(),
+                        |app: &mut KdeConnectApplet| {
+                            let new_id = cosmic::iced::window::Id::unique();
+
+                            app.popup.replace(new_id);
+
+                            let mut popup_settings = app.core.applet.get_popup_settings(
+                                app.core.main_window_id().unwrap(),
+                                new_id,
+                                None,
+                                None,
+                                None,
+                            );
+                            popup_settings.positioner.size_limits = Limits::NONE
+                                .max_width(400.0)
+                                .min_width(300.0)
+                                .min_height(200.0)
+                                .max_height(600.0);
+                            popup_settings
+                        },
+                        None,
+                    ));
+
                     // Fetch devices right away — the polling subscriptions
                     // only run while the popup is open, and their first tick
                     // is a full interval away. The unread-SMS check follows
@@ -111,13 +111,13 @@ impl cosmic::Application for KdeConnectApplet {
                             cosmic::Action::App(Message::DevicesUpdated(devices))
                         }),
                     ])
+                };
+            }
+            Message::PopupClosed(id) => {
+                if self.popup.as_ref() == Some(&id) {
+                    self.popup = None;
                 }
             }
-	    Message::PopupClosed(id) => {
-		if self.popup.as_ref() == Some(&id) {
-		    self.popup = None;
-		}
-	    }
             Message::RefreshDevices => {
                 // The unread-SMS check follows from the resulting
                 // DevicesUpdated, against the fresh device list.
@@ -156,7 +156,9 @@ impl cosmic::Application for KdeConnectApplet {
                     self.expanded_device = Some(device_id.clone());
                     let id = device_id.clone();
                     return Task::perform(
-                        async move { backend::request_run_commands(id).await.ok(); },
+                        async move {
+                            backend::request_run_commands(id).await.ok();
+                        },
                         |_| cosmic::Action::App(Message::RefreshDevices),
                     );
                 }
@@ -175,14 +177,18 @@ impl cosmic::Application for KdeConnectApplet {
                     id, device_name
                 );
 
-                // Spawn in a thread so the process::Command doesn't block the executor
+                // Spawn in a thread so the process::Command doesn't block the executor.
+                // The thread waits on the child so it doesn't become a zombie.
                 std::thread::spawn(move || {
                     match std::process::Command::new("cosmic-ext-connect-sms")
                         .arg(&id)
                         .arg(&device_name)
                         .spawn()
                     {
-                        Ok(_) => info!("cosmic-ext-connect-sms launched"),
+                        Ok(mut child) => {
+                            info!("cosmic-ext-connect-sms launched");
+                            let _ = child.wait();
+                        }
                         Err(e) => error!("Failed to launch cosmic-ext-connect-sms: {:?}", e),
                     }
                 });
@@ -217,13 +223,12 @@ impl cosmic::Application for KdeConnectApplet {
             }
             Message::UnmountDevice(ref device_id) => {
                 let id = device_id.clone();
-                return Task::perform(
-                    async move { backend::unmount_device(id).await },
-                    |result| match result {
+                return Task::perform(async move { backend::unmount_device(id).await }, |result| {
+                    match result {
                         Ok(()) => cosmic::Action::App(Message::RefreshDevices),
                         Err(e) => cosmic::Action::App(Message::BrowseDeviceFailed(e.to_string())),
-                    },
-                );
+                    }
+                });
             }
             Message::BrowseDeviceFailed(message) => {
                 self.error_banner = Some(message);
@@ -274,7 +279,11 @@ impl cosmic::Application for KdeConnectApplet {
                 let id = device_id.clone();
                 let result_device_id = id.clone();
                 return Task::perform(
-                    async move { backend::share_clipboard(id).await.map_err(|e| e.to_string()) },
+                    async move {
+                        backend::share_clipboard(id)
+                            .await
+                            .map_err(|e| e.to_string())
+                    },
                     move |result| {
                         cosmic::Action::App(Message::ClipboardSendFinished {
                             device_id: result_device_id.clone(),
@@ -293,14 +302,18 @@ impl cosmic::Application for KdeConnectApplet {
                     device.is_charging = Some(charging);
                     // Also patch the backend cache so the next fetch_devices() preserves it
                     let d = device.clone();
-                    tokio::spawn(async move { backend::update_device(device_id, d).await; });
+                    tokio::spawn(async move {
+                        backend::update_device(device_id, d).await;
+                    });
                 }
             }
             Message::ConnectivityUpdated(device_id, strength) => {
                 if let Some(device) = self.devices.get_mut(&device_id) {
                     device.signal_strength = Some(strength);
                     let d = device.clone();
-                    tokio::spawn(async move { backend::update_device(device_id, d).await; });
+                    tokio::spawn(async move {
+                        backend::update_device(device_id, d).await;
+                    });
                 }
             }
             Message::AcceptPairing(ref device_id) => {
@@ -324,7 +337,10 @@ impl cosmic::Application for KdeConnectApplet {
                 );
             }
             Message::PairingRequestReceived(device_id, device_name) => {
-                info!("Pairing request received from {} ({})", device_name, device_id);
+                info!(
+                    "Pairing request received from {} ({})",
+                    device_name, device_id
+                );
                 self.pairing_requests.insert(device_id, device_name.clone());
 
                 // Show a system notification so the user is alerted even if they
@@ -371,9 +387,13 @@ impl cosmic::Application for KdeConnectApplet {
                 );
             }
             Message::OpenSettings => {
-                std::process::Command::new("cosmic-ext-connect-settings")
-                    .spawn()
-                    .ok();
+                if let Ok(mut child) =
+                    std::process::Command::new("cosmic-ext-connect-settings").spawn()
+                {
+                    std::thread::spawn(move || {
+                        let _ = child.wait();
+                    });
+                }
             }
             Message::RemoteInput(ref device_id) => {
                 debug!("Remote input: {}", device_id);
@@ -396,7 +416,9 @@ impl cosmic::Application for KdeConnectApplet {
             Message::RequestRunCommands(ref device_id) => {
                 let id = device_id.clone();
                 return Task::perform(
-                    async move { backend::request_run_commands(id).await.ok(); },
+                    async move {
+                        backend::request_run_commands(id).await.ok();
+                    },
                     |_| cosmic::Action::App(Message::RefreshDevices),
                 );
             }
@@ -415,14 +437,18 @@ impl cosmic::Application for KdeConnectApplet {
                     device.run_commands = commands;
                     let d = device.clone();
                     let did = device_id.clone();
-                    tokio::spawn(async move { backend::update_device(did, d).await; });
+                    tokio::spawn(async move {
+                        backend::update_device(did, d).await;
+                    });
                 }
             }
             Message::ExecuteRunCommand(ref device_id, ref key) => {
                 let id = device_id.clone();
                 let k = key.clone();
                 return Task::perform(
-                    async move { backend::execute_run_command(id, k).await.ok(); },
+                    async move {
+                        backend::execute_run_command(id, k).await.ok();
+                    },
                     |_| cosmic::Action::App(Message::RefreshDevices),
                 );
             }
@@ -537,8 +563,7 @@ fn main() -> cosmic::iced::Result {
     if std::env::var("KDECONNECT_LOG_FILE").is_ok_and(|v| !v.is_empty())
         && std::path::Path::new("/.flatpak-info").exists()
     {
-        let log_dir = dirs::data_dir()
-            .unwrap_or_else(|| std::path::PathBuf::from("/tmp"));
+        let log_dir = dirs::data_dir().unwrap_or_else(|| std::path::PathBuf::from("/tmp"));
         let _ = std::fs::create_dir_all(&log_dir);
         let file = std::fs::OpenOptions::new()
             .create(true)
@@ -574,14 +599,28 @@ fn main() -> cosmic::iced::Result {
             .to_string_lossy()
             .to_string()
     });
-    let _ = std::process::Command::new("kdeconnect-service")
+    if let Ok(mut child) = std::process::Command::new("kdeconnect-service")
         .env("HOME", &home)
-        .env("XDG_RUNTIME_DIR", std::env::var("XDG_RUNTIME_DIR").unwrap_or_default())
-        .env("XDG_CONFIG_HOME", std::env::var("XDG_CONFIG_HOME").unwrap_or_default())
+        .env(
+            "XDG_RUNTIME_DIR",
+            std::env::var("XDG_RUNTIME_DIR").unwrap_or_default(),
+        )
+        .env(
+            "XDG_CONFIG_HOME",
+            std::env::var("XDG_CONFIG_HOME").unwrap_or_default(),
+        )
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
-        .spawn();
+        .spawn()
+    {
+        // Reap the child process when it exits so it does not become a zombie.
+        // If the service is already running it exits immediately (D-Bus name
+        // already taken), but the kernel still requires the parent to wait on it.
+        std::thread::spawn(move || {
+            let _ = child.wait();
+        });
+    }
 
     cosmic::applet::run::<KdeConnectApplet>(())
 }

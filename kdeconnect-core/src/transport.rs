@@ -597,11 +597,11 @@ pub(crate) async fn receive_payload(
 
     debug!("connected");
 
-    if let Ok(mut save_path) = tokio::fs::File::create(&temp_file).await {
-        let _ = tokio::io::copy(&mut stream, &mut save_path).await;
-        let _ = stream.flush().await;
-        let _ = stream.shutdown().await;
-    }
+    let mut save_path = tokio::fs::File::create(&temp_file).await?;
+    tokio::io::copy(&mut stream, &mut save_path).await?;
+    save_path.flush().await?;
+    stream.flush().await?;
+    stream.shutdown().await?;
 
     info!("successfully received payload");
 

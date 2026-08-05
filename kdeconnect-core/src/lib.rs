@@ -163,6 +163,18 @@ impl KdeConnectCore {
             CoreEvent::PacketReceived { device, packet } => {
                 info!("[core] packet received from device: {}", device);
                 if let Some(device_obj) = self.device_manager.get_device(&device).await {
+                    // Reject anything from a device we haven't paired with — an
+                    // unpaired peer can complete the TLS handshake (KDE Connect
+                    // accepts any self-signed cert) but must not be able to
+                    // trigger plugin side-effects such as run_command execution.
+                    if device_obj.pair_state != crate::device::PairState::Paired {
+                        tracing::warn!(
+                            "[core] dropping {:?} from unpaired device {}",
+                            packet.packet_type,
+                            device
+                        );
+                        return;
+                    }
                     self.plugin_registry
                         .dispatch(
                             device_obj,
@@ -232,8 +244,10 @@ impl KdeConnectCore {
             }
             CoreEvent::SendPacket { device, packet } => {
                 info!("[core] sending packet");
-                if let Some(sender) = guard.get(&device) {
-                    sender.send(packet).unwrap();
+                if let Some(sender) = guard.get(&device)
+                    && sender.send(packet).is_err()
+                {
+                    tracing::warn!("[core] writer for {} is closed, dropping packet", device);
                 }
             }
             CoreEvent::SendPaylod {
@@ -271,9 +285,13 @@ impl KdeConnectCore {
             } => {
                 debug!("[core] new connection from: {}", addr);
 
-                let device = Device::new(id.0.clone(), name, addr)
-                    .await
-                    .expect("cannot create new device from metadata");
+                let device = match Device::new(id.0.clone(), name, addr).await {
+                    Ok(device) => device,
+                    Err(e) => {
+                        tracing::error!("[core] failed to create device for {}: {}", addr, e);
+                        return;
+                    }
+                };
 
                 self.device_manager
                     .add_or_update_device(id.clone(), device.clone())
@@ -481,15 +499,26 @@ impl KdeConnectCore {
 
                 if let Some(sender) = sender {
                     debug!("sender available.");
-                    let pkts = ShareRequest::share_files(files_list)
-                        .await
-                        .expect("creating share request");
+                    let pkts = match ShareRequest::share_files(files_list).await {
+                        Ok(pkts) => pkts,
+                        Err(e) => {
+                            tracing::error!("[core] failed to prepare files for sharing: {}", e);
+                            return;
+                        }
+                    };
                     for (pkt_body, path) in pkts {
-                        let packet = ProtocolPacket::new(
-                            PacketType::ShareRequest,
-                            serde_json::to_value(pkt_body).expect("serializing packet body"),
-                        );
-                        let file = DeviceFile::open(path).await.expect("opening file");
+                        let Ok(body_value) = serde_json::to_value(pkt_body) else {
+                            tracing::error!("[core] failed to serialize share request for {:?}", path);
+                            continue;
+                        };
+                        let packet = ProtocolPacket::new(PacketType::ShareRequest, body_value);
+                        let file = match DeviceFile::open(path.clone()).await {
+                            Ok(file) => file,
+                            Err(e) => {
+                                tracing::error!("[core] failed to open {:?} for sharing: {}", path, e);
+                                continue;
+                            }
+                        };
                         let payload = DevicePayload::from(file);
                         //
                         // crate transfer adapter to get file transfer progress

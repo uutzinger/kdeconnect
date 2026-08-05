@@ -107,6 +107,7 @@ sms-select-conversation = Wybierz konwersacje, aby zobaczyć wiadomości
 sms-conversation-not-found = Nie znaleziono konwersacji
 sms-waiting-for-messages = Oczekiwanie na wiadomości…
 sms-messages-will-appear = Wiadomości zostaną wyświetlone po synchronizacji
+sms-load-more-messages = Załaduj starsze wiadomości
 sms-message-placeholder = Napisz wiadomość…
 sms-send = Wyślij
 

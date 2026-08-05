@@ -653,7 +653,12 @@ async fn run(cmd: &mut Command) -> anyhow::Result<()> {
 }
 
 async fn open(mount_point: &str) -> anyhow::Result<()> {
-    host_command("xdg-open").arg(mount_point).spawn()?;
+    let mut child = host_command("xdg-open").arg(mount_point).spawn()?;
+    // xdg-open forks its handler and exits quickly; reap it in the
+    // background so it doesn't linger as a zombie.
+    tokio::spawn(async move {
+        let _ = child.wait().await;
+    });
     Ok(())
 }
 
