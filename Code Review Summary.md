@@ -9,8 +9,6 @@ P1 = high priority. P2 = normal priority. Reviews are ordered oldest first; appe
 - [First review - 2026-08-05](#first-review---2026-08-05)
 - [Second review - 2026-09-20](#second-review---2026-09-20)
 - [Incoming image transfer - 2026-09-20](#incoming-image-transfer---2026-09-20)
-- [P1 core fixes - 2026-09-20](#p1-core-fixes---2026-09-20)
-- [P1 SMS fixes - 2026-09-20](#p1-sms-fixes---2026-09-20)
 
 ## First Review - 2026-08-05
 
@@ -78,7 +76,7 @@ get_contact_name() and get_contact_photo() (views.rs:720-735) do a linear scan o
 
 ## Second Review - 2026-09-20
 
-Reviewed source at `ef47cb9`. Statuses include the implementation follow-up at the end of this document. No live phone or GUI integration testing was performed.
+Reviewed source at `ef47cb9`. No live phone or GUI integration testing was performed.
 
 ### SMS Issues
 
@@ -110,6 +108,52 @@ Reviewed source at `ef47cb9`. Statuses include the implementation follow-up at t
 
 ✅ **Earlier changes checked in source**: Unpaired-device dispatch gate, payload I/O error propagation, bounded SMS rendering, cached dropdown/search values, batched message processing, and applet child reaping are present. Remaining gaps are listed above; the first review's pending rich-text allocations and best-effort send logging remain open.
 
+### P1 Core Fixes
+
+#### kdeconnect-core
+
+✅ **Certificate pinning and pairing persistence**: Approved peer certificates are stored atomically with paired state. Changed certificates are rejected before packet dispatch; payload clients and servers must present the same pinned certificate. Pending approvals are tied to the live connection and reset on reconnect. Local unpair can clear a pin even when certificate mismatch prevents reconnection.
+
+✅ **Legacy pairing migration**: Records without a pinned certificate load as unpaired and require explicit approval again. No certificate is silently trusted during upgrade. Device metadata is refreshed from the current connection.
+
+✅ **Contained file reception**: Added `download.rs` for basename validation, temporary-file ownership, cleanup, atomic cache replacement, and no-clobber shared-file publication. Updated share, MMS, and album-art payload callers to use open descriptors instead of reopening remote-selected paths.
+
+✅ **Bounded connection setup**: The entire pre-TLS identity exchange and handshake runs outside the accept loop, limited to 32 concurrent tasks with a 15-second deadline. Connection IDs reject queued stale packets; closing/replacing a writer also closes its reader.
+
+#### Verification
+
+✅ **Core regression tests**: `cargo test -p kdeconnect-core --lib --locked --offline`: 20 passed, including legacy pairing, stored-pin reload/revocation, mismatched certificates in both TLS payload directions, path traversal, symlinks, duplicate names, temporary-file cleanup, and listener responsiveness/deadline. The loopback socket test requires permission outside the execution sandbox.
+
+✅ **Workspace build**: `cargo check --workspace --locked --offline` passed. No dependency changes were needed.
+
+⏳ **Live-device validation**: Install/restart the updated service, explicitly re-pair the phone, verify reconnect and changed-certificate rejection, and test incoming/outgoing image transfers. No service was installed or restarted during implementation. Transfer-size validation, transfer status/error reporting, and the other pending review items remain separate work.
+
+### P1 SMS Fixes
+
+#### SMS UI
+
+✅ **Newest messages shown first**: The bounded message view skips the hidden older prefix and renders the most recent messages in chronological order. Increasing the window exposes older messages without hiding new arrivals.
+
+✅ **SMS windows filter by device**: Message and MMS attachment events include their source device ID. Each SMS window ignores events belonging to other phones.
+
+#### kdeconnect-core
+
+✅ **SMS events retain source identity**: `ConnectionEvent::SmsMessages` carries `(DeviceId, SmsMessages)`; the plugin dispatcher attaches the authenticated source device before forwarding the event.
+
+#### kdeconnect-service
+
+✅ **Per-device SMS cache**: Replaced the single optional in-memory SMS payload with a map keyed by device ID. Incoming messages update memory and disk using their source ID. D-Bus and Varlink cache reads return only the requested device's data.
+
+✅ **Device-scoped D-Bus signals**: SMS message and attachment signals include `device_id`; the D-Bus client exposes it in `ServiceEvent`.
+
+#### Verification
+
+✅ **Service tests**: `cargo test -p kdeconnect-service --locked --offline`: 2 passed, 1 compositor-dependent clipboard test ignored. The new test confirms two phones retain distinct SMS cache values.
+
+✅ **Applet tests**: `cargo test -p cosmic-ext-connect-applet --locked --offline`: 3 passed. The new test confirms a 150-message thread initially renders messages 50 through 149.
+
+⏳ **Live multi-phone validation**: Install/restart the updated service and verify two paired phones cannot populate each other's SMS window or cache. No service was installed or restarted during this implementation.
+
 ## Incoming Image Transfer - 2026-09-20
 
 The reported missing image was not reproduced; its historical failure cause remains unknown. The running service's stdout/stderr pointed to `/dev/null`. Items below extend the second review's transfer findings and remain pending.
@@ -135,50 +179,3 @@ The reported missing image was not reproduced; its historical failure cause rema
 ### Verification
 
 ⏳ **FT-07: Test failures and a real phone transfer**: Cover malformed/missing metadata, connection refusal, TLS failure, stalled reception, unavailable destination, unsafe names, simultaneous duplicate names, short/excess payloads, and notification failure. Confirm one terminal result and matching diagnostic per detected transfer. Share a known image from the phone and verify contents, size, destination, UI status, and logs; record the installed build and timestamps.
-
-## P1 Core Fixes - 2026-09-20
-
-### kdeconnect-core
-
-✅ **Certificate pinning and pairing persistence**: Approved peer certificates are stored atomically with paired state. Changed certificates are rejected before packet dispatch; payload clients and servers must present the same pinned certificate. Pending approvals are tied to the live connection and reset on reconnect. Local unpair can clear a pin even when certificate mismatch prevents reconnection.
-
-✅ **Legacy pairing migration**: Records without a pinned certificate load as unpaired and require explicit approval again. No certificate is silently trusted during upgrade. Device metadata is refreshed from the current connection.
-
-✅ **Contained file reception**: Added `download.rs` for basename validation, temporary-file ownership, cleanup, atomic cache replacement, and no-clobber shared-file publication. Updated share, MMS, and album-art payload callers to use open descriptors instead of reopening remote-selected paths.
-
-✅ **Bounded connection setup**: The entire pre-TLS identity exchange and handshake runs outside the accept loop, limited to 32 concurrent tasks with a 15-second deadline. Connection IDs reject queued stale packets; closing/replacing a writer also closes its reader.
-
-### Verification
-
-✅ **Core regression tests**: `cargo test -p kdeconnect-core --lib --locked --offline`: 20 passed, including legacy pairing, stored-pin reload/revocation, mismatched certificates in both TLS payload directions, path traversal, symlinks, duplicate names, temporary-file cleanup, and listener responsiveness/deadline. The loopback socket test requires permission outside the execution sandbox.
-
-✅ **Workspace build**: `cargo check --workspace --locked --offline` passed. No dependency changes were needed.
-
-⏳ **Live-device validation**: Install/restart the updated service, explicitly re-pair the phone, verify reconnect and changed-certificate rejection, and test incoming/outgoing image transfers. No service was installed or restarted during implementation. Transfer-size validation, transfer status/error reporting, and the other pending review items remain separate work.
-
-
-## P1 SMS Fixes - 2026-09-20
-
-### SMS UI
-
-✅ **Newest messages shown first**: The bounded message view skips the hidden older prefix and renders the most recent messages in chronological order. Increasing the window exposes older messages without hiding new arrivals.
-
-✅ **SMS windows filter by device**: Message and MMS attachment events include their source device ID. Each SMS window ignores events belonging to other phones.
-
-### kdeconnect-core
-
-✅ **SMS events retain source identity**: `ConnectionEvent::SmsMessages` carries `(DeviceId, SmsMessages)`; the plugin dispatcher attaches the authenticated source device before forwarding the event.
-
-### kdeconnect-service
-
-✅ **Per-device SMS cache**: Replaced the single optional in-memory SMS payload with a map keyed by device ID. Incoming messages update memory and disk using their source ID. D-Bus and Varlink cache reads return only the requested device's data.
-
-✅ **Device-scoped D-Bus signals**: SMS message and attachment signals include `device_id`; the D-Bus client exposes it in `ServiceEvent`.
-
-### Verification
-
-✅ **Service tests**: `cargo test -p kdeconnect-service --locked --offline`: 2 passed, 1 compositor-dependent clipboard test ignored. The new test confirms two phones retain distinct SMS cache values.
-
-✅ **Applet tests**: `cargo test -p cosmic-ext-connect-applet --locked --offline`: 3 passed. The new test confirms a 150-message thread initially renders messages 50 through 149.
-
-⏳ **Live multi-phone validation**: Install/restart the updated service and verify two paired phones cannot populate each other's SMS window or cache. No service was installed or restarted during this implementation.
