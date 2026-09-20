@@ -248,15 +248,19 @@ pub async fn download_album_art(
         .chars()
         .map(|c| if c.is_alphanumeric() { c } else { '_' })
         .collect();
-    let dest = cache_dir.join(format!(
+    let filename = format!(
         "{}_{}_{:x}.art",
         device.device_id.0, sanitized_player, hash
-    ));
+    );
+    let download = crate::download::Download::new(&cache_dir, &filename)?;
+    let mut file = download.writer()?;
 
     let mut remote_addr = device.address;
     remote_addr.set_port(info.port);
 
-    receive_payload(&device.device_id, &remote_addr, &dest).await?;
+    receive_payload(device, &remote_addr, &mut file).await?;
+    drop(file);
+    let dest = download.finish(false)?;
 
     Ok(dest.to_string_lossy().into_owned())
 }

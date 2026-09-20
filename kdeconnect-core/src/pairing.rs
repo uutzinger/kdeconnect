@@ -3,7 +3,7 @@ use std::net::SocketAddr;
 use tracing::{debug, info};
 
 use crate::{
-    device::{Device, DeviceId, DeviceManager, PairState},
+    device::{DeviceId, DeviceManager, PairState},
     protocol::{Pair, ProtocolPacket},
 };
 
@@ -26,7 +26,7 @@ impl PairingManager {
         &self,
         id: DeviceId,
         name: String,
-        addr: SocketAddr,
+        _addr: SocketAddr,
         packet: ProtocolPacket,
     ) -> anyhow::Result<bool> {
         info!(
@@ -42,11 +42,13 @@ impl PairingManager {
             }
         };
 
-        // Ensure device is known and up to date.
-        let device = Device::new(id.0.clone(), name.clone(), addr).await?;
-        self.device_manager
-            .add_or_update_device(id.clone(), device.clone())
-            .await;
+        // Use the live connection's certificate and pending state, never reload
+        // an identity from disk in response to an unauthenticated pair packet.
+        let device = self
+            .device_manager
+            .get_device(&id)
+            .await
+            .ok_or_else(|| anyhow::anyhow!("pair request without a live device"))?;
 
         let current_state = device.pair_state;
 
@@ -58,7 +60,7 @@ impl PairingManager {
         // We sent a pair request and the phone accepted it.
         if current_state == PairState::Requesting {
             info!("Pairing accepted by {}", name);
-            self.device_manager.set_paired(&id, true).await;
+            self.device_manager.set_paired(&id, true).await?;
             return Ok(false);
         }
 
@@ -74,11 +76,14 @@ impl PairingManager {
             .update_pair_state(&id, PairState::Requested)
             .await;
 
-        info!("Pair request received from {} — awaiting user decision", name);
+        info!(
+            "Pair request received from {} — awaiting user decision",
+            name
+        );
         Ok(true)
     }
 
-    pub async fn cancel_pairing(&self, device_id: DeviceId) {
+    pub async fn cancel_pairing(&self, device_id: DeviceId) -> anyhow::Result<()> {
         self.device_manager.set_paired(&device_id, false).await
     }
 }

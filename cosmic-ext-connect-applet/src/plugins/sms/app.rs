@@ -22,6 +22,10 @@ use super::views;
 /// loaded on demand so a long conversation doesn't degrade input latency.
 const INITIAL_MESSAGES_WINDOW: usize = 100;
 
+pub(crate) fn message_window_start(total: usize, window_size: usize) -> usize {
+    total.saturating_sub(window_size)
+}
+
 pub struct SmsWindow {
     core: Core,
     pub device_id: String,
@@ -68,6 +72,28 @@ pub struct SmsWindow {
     /// File paths staged via the attach button, sent (and cleared) with
     /// the next outgoing message.
     pub pending_attachments: Vec<String>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::message_window_start;
+
+    #[test]
+    fn message_window_starts_at_newest_page() {
+        assert_eq!(message_window_start(150, 100), 50);
+        assert_eq!(message_window_start(150, 200), 0);
+        assert_eq!(message_window_start(50, 100), 0);
+
+        let messages: Vec<_> = (0..150).collect();
+        let visible: Vec<_> = messages
+            .iter()
+            .skip(message_window_start(messages.len(), 100))
+            .copied()
+            .collect();
+        assert_eq!(visible.first(), Some(&50));
+        assert_eq!(visible.last(), Some(&149));
+        assert_eq!(visible.len(), 100);
+    }
 }
 
 impl Application for SmsWindow {
@@ -196,7 +222,8 @@ impl Application for SmsWindow {
                         while let Some(event) = event_stream.next().await {
                             use kdeconnect_dbus_client::ServiceEvent;
                             match event {
-                                ServiceEvent::SmsMessagesReceived(json) => {
+                                ServiceEvent::SmsMessagesReceived(event_device_id, json)
+                                    if event_device_id == device_id => {
                                     debug!("SmsMessagesReceived len={}", json.len());
                                     let (messages, conversations) = dbus::parse_sms_messages(&json);
                                     yield SmsMessage::ProtocolEventReceived(
@@ -210,10 +237,13 @@ impl Application for SmsWindow {
                                     debug!("ContactsReceived {} entries", contacts.len());
                                     yield SmsMessage::ContactsLoaded(contacts);
                                 }
-                                ServiceEvent::SmsAttachmentReceived(filename, path) => {
+                                ServiceEvent::SmsAttachmentReceived(event_device_id, filename, path)
+                                    if event_device_id == device_id => {
                                     debug!("SmsAttachmentReceived {} -> {}", filename, path);
                                     yield SmsMessage::AttachmentReceived(filename, path.into());
                                 }
+                                ServiceEvent::SmsMessagesReceived(_, _)
+                                | ServiceEvent::SmsAttachmentReceived(_, _, _) => {}
                                 ServiceEvent::ContactPhotosReceived(photos) => {
                                     debug!("ContactPhotosReceived {} entries", photos.len());
                                     let decoded: HashMap<String, Vec<u8>> = photos

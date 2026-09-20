@@ -26,6 +26,7 @@ pub mod hidden_conversations;
 pub mod sms_read_state;
 pub(crate) mod crypto;
 pub mod device;
+mod download;
 pub mod event;
 pub mod filetransfer;
 pub(crate) mod pairing;
@@ -60,6 +61,13 @@ pub struct KdeConnectCore {
 }
 
 impl KdeConnectCore {
+    async fn is_paired(&self, id: &DeviceId) -> bool {
+        self.device_manager
+            .get_device(id)
+            .await
+            .is_some_and(|device| device.payload_certificate().is_ok())
+    }
+
     pub async fn new() -> anyhow::Result<(Self, mpsc::UnboundedReceiver<ConnectionEvent>)> {
         let (out_tx, in_rx) = mpsc::unbounded_channel();
         let (conn_tx, conn_rx) = mpsc::unbounded_channel();
@@ -160,7 +168,10 @@ impl KdeConnectCore {
         let guard = self.writer_map.lock().await;
 
         match event {
-            CoreEvent::PacketReceived { device, packet } => {
+            CoreEvent::PacketReceived { device, packet, conn_id } => {
+                if self.conn_id_map.lock().await.get(&device) != Some(&conn_id) {
+                    return;
+                }
                 info!("[core] packet received from device: {}", device);
                 if let Some(device_obj) = self.device_manager.get_device(&device).await {
                     // Reject anything from a device we haven't paired with — an
@@ -243,6 +254,9 @@ impl KdeConnectCore {
                 self.broadcast_conn_event(conn_event);
             }
             CoreEvent::SendPacket { device, packet } => {
+                if !self.is_paired(&device).await {
+                    return;
+                }
                 info!("[core] sending packet");
                 if let Some(sender) = guard.get(&device)
                     && sender.send(packet).is_err()
@@ -263,8 +277,11 @@ impl KdeConnectCore {
                     TransferAdapter::new(payload, payload_size, self.conn_tx.clone());
 
                 if let Some(sender) = guard.get(&device) {
+                    let Some(peer) = self.device_manager.get_device(&device).await else {
+                        return;
+                    };
                     self.plugin_registry
-                        .send_payload(packet, sender, transfer_adapter, payload_size)
+                        .send_payload(peer, packet, sender, transfer_adapter, payload_size)
                         .await;
                 }
             }
@@ -280,18 +297,32 @@ impl KdeConnectCore {
                 addr,
                 id,
                 name,
+                certificate,
+                accepted,
                 write_tx,
                 conn_id,
             } => {
                 debug!("[core] new connection from: {}", addr);
 
-                let device = match Device::new(id.0.clone(), name, addr).await {
+                let mut device = match Device::new(id.0.clone(), name, addr).await {
                     Ok(device) => device,
                     Err(e) => {
                         tracing::error!("[core] failed to create device for {}: {}", addr, e);
                         return;
                     }
                 };
+
+                if let Err(e) = device.bind_certificate(certificate.clone()) {
+                    tracing::warn!("[core] rejecting connection for {}: {}", id, e);
+                    return;
+                }
+                if self.conn_id_map.lock().await.contains_key(&id)
+                    && let Some(current) = self.device_manager.get_device(&id).await
+                    && current.connection_certificate.as_ref() != Some(&certificate)
+                {
+                    tracing::warn!("[core] refusing certificate replacement on active connection for {}", id);
+                    return;
+                }
 
                 self.device_manager
                     .add_or_update_device(id.clone(), device.clone())
@@ -306,6 +337,12 @@ impl KdeConnectCore {
                 // is intentionally superseded. Dropping the old write_tx here causes
                 // the old writer task's recv() to return None, ending that task cleanly.
                 self.writer_map.lock().await.insert(id.clone(), write_tx);
+
+                if accepted.send(true).is_err() {
+                    self.writer_map.lock().await.remove(&id);
+                    self.conn_id_map.lock().await.remove(&id);
+                    return;
+                }
 
                 self.pending_pair.lock().await.remove(&id);
 
@@ -331,7 +368,10 @@ impl KdeConnectCore {
                 let conn_event = ConnectionEvent::Connected((id.clone(), device.clone()));
                 self.broadcast_conn_event(conn_event);
             }
-            TransportEvent::IncomingPacket { addr, id, raw } => {
+            TransportEvent::IncomingPacket { addr, id, raw, conn_id } => {
+                if self.conn_id_map.lock().await.get(&id) != Some(&conn_id) {
+                    return;
+                }
                 info!("[core] incoming packet.");
                 match serde_json::from_str::<ProtocolPacket>(&raw) {
                     Ok(pkt) => {
@@ -385,6 +425,7 @@ impl KdeConnectCore {
                         } else {
                             let _ = self.event_tx.send(CoreEvent::PacketReceived {
                                 device: id.clone(),
+                                conn_id,
                                 packet: pkt.clone(),
                             });
                         }
@@ -437,6 +478,9 @@ impl KdeConnectCore {
                 let _ = self.udp_transport.send_identity().await;
             }
             AppEvent::Pair(device_id) => {
+                if !guard.contains_key(&device_id) || self.is_paired(&device_id).await {
+                    return;
+                }
                 info!("frontend sent pair event to device: {}", device_id);
                 Self::send_pair_packet(&guard, &device_id, true);
                 self.device_manager
@@ -455,6 +499,9 @@ impl KdeConnectCore {
                 };
             }
             AppEvent::SendPacket(device_id, packet) => {
+                if !self.is_paired(&device_id).await {
+                    return;
+                }
                 info!("Sending packet to device: {}", device_id);
                 if let Some(sender) = guard.get(&device_id) {
                     let _ = sender.send(packet);
@@ -468,7 +515,9 @@ impl KdeConnectCore {
             }
             AppEvent::SendPacketWithReply(device_id, packet, reply) => {
                 info!("Sending acknowledged packet to device: {}", device_id);
-                let result = if let Some(plugin_id) =
+                let result = if !self.is_paired(&device_id).await {
+                    Err(format!("Device {device_id} is not paired"))
+                } else if let Some(plugin_id) =
                     crate::plugin_interface::packet_plugin_id(&packet.packet_type)
                     && !self
                         .plugin_registry
@@ -489,6 +538,12 @@ impl KdeConnectCore {
                 plugins::run_command::send_command_list(&device_id, self.event_tx.clone()).await;
             }
             AppEvent::SendFiles((device_id, files_list)) => {
+                let Some(peer) = self.device_manager.get_device(&device_id).await else {
+                    return;
+                };
+                if peer.payload_certificate().is_err() {
+                    return;
+                }
                 info!("frontend trying to sent files to device: {}", device_id);
 
                 // Clone the sender and drop the lock immediately — send_payload
@@ -526,7 +581,7 @@ impl KdeConnectCore {
                             TransferAdapter::new(payload.buf, payload.size, self.conn_tx.clone());
 
                         self.plugin_registry
-                            .send_payload(packet, &sender, transfer_adapter, payload.size)
+                            .send_payload(peer.clone(), packet, &sender, transfer_adapter, payload.size)
                             .await;
                     }
 
@@ -570,7 +625,10 @@ impl KdeConnectCore {
                 Self::send_pair_packet(&guard, &device_id, false);
                 drop(guard);
 
-                let _ = self.pairing.cancel_pairing(device_id.clone()).await;
+                if let Err(e) = self.pairing.cancel_pairing(device_id.clone()).await {
+                    tracing::error!("failed to unpair {}: {}", device_id, e);
+                    return;
+                }
                 cleanup_device_data(&device_id.0).await;
 
                 self.broadcast_conn_event(ConnectionEvent::PairStateChanged((
@@ -580,10 +638,21 @@ impl KdeConnectCore {
                 return;
             }
             AppEvent::AcceptPairing(device_id) => {
+                if !guard.contains_key(&device_id) {
+                    return;
+                }
+                if self.device_manager.get_device(&device_id).await
+                    .is_none_or(|d| d.pair_state != crate::device::PairState::Requested)
+                {
+                    return;
+                }
                 info!("User accepted pairing from {}", device_id);
+                if let Err(e) = self.device_manager.set_paired(&device_id, true).await {
+                    tracing::error!("failed to approve pairing for {}: {}", device_id, e);
+                    return;
+                }
                 // Send pair:true to the phone — it is waiting for our response.
                 Self::send_pair_packet(&guard, &device_id, true);
-                self.device_manager.set_paired(&device_id, true).await;
             }
             AppEvent::RejectPairing(device_id) => {
                 info!("User rejected pairing from {}", device_id);

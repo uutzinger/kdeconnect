@@ -31,7 +31,7 @@ pub enum ServiceEvent {
     DeviceConnected(String, Device),
     DevicePaired(String, Device),
     DeviceDisconnected(String),
-    SmsMessagesReceived(String),               // JSON string
+    SmsMessagesReceived(String, String),       // device_id, JSON string
     ContactsReceived(HashMap<String, String>), // phone -> name
     PairingRequested(String, String),          // device_id, device_name
     ClipboardReceived(String),                 // clipboard content from phone
@@ -41,7 +41,7 @@ pub enum ServiceEvent {
     BrowseFailed(String, String),              // device_id, message
     MountStateChanged(String, bool),           // device_id, mounted
     /// (filename/unique_identifier, local file path)
-    SmsAttachmentReceived(String, String),
+    SmsAttachmentReceived(String, String, String), // device_id, filename, path
     /// Phone -> base64-encoded photo
     ContactPhotosReceived(HashMap<String, String>),
 }
@@ -153,12 +153,21 @@ trait Sms {
     ) -> zbus::Result<()>;
 
     #[zbus(signal)]
-    async fn sms_messages_received(&self, messages_json: String) -> zbus::Result<()>;
+    async fn sms_messages_received(
+        &self,
+        device_id: String,
+        messages_json: String,
+    ) -> zbus::Result<()>;
 
     /// `filename` is the same `unique_identifier` the request was made
     /// with — that's how the caller matches this back to a message.
     #[zbus(signal)]
-    async fn sms_attachment_received(&self, filename: String, path: String) -> zbus::Result<()>;
+    async fn sms_attachment_received(
+        &self,
+        device_id: String,
+        filename: String,
+        path: String,
+    ) -> zbus::Result<()>;
 }
 
 /// D-Bus proxy for Contacts interface
@@ -426,7 +435,10 @@ impl KdeConnectClient {
             .await?
             .filter_map(|s| async move {
                 match s.args() {
-                    Ok(args) => Some(ServiceEvent::SmsMessagesReceived(args.messages_json.clone())),
+                    Ok(args) => Some(ServiceEvent::SmsMessagesReceived(
+                        args.device_id.clone(),
+                        args.messages_json.clone(),
+                    )),
                     Err(e) => {
                         error!("Failed to parse SmsMessagesReceived signal: {:?}", e);
                         None
@@ -576,6 +588,7 @@ impl KdeConnectClient {
             .filter_map(|s| async move {
                 match s.args() {
                     Ok(args) => Some(ServiceEvent::SmsAttachmentReceived(
+                        args.device_id.clone(),
                         args.filename.clone(),
                         args.path.clone(),
                     )),

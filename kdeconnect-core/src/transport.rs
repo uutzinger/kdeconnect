@@ -1,8 +1,7 @@
 use std::{
     net::{Ipv4Addr, SocketAddr, SocketAddrV4},
-    path::PathBuf,
     sync::{
-        Arc,
+        Arc, LazyLock,
         atomic::{AtomicU64, Ordering},
     },
     time::Duration,
@@ -13,15 +12,15 @@ use socket2::TcpKeepalive;
 use tokio::{
     io::{AsyncBufReadExt as _, AsyncReadExt as _, AsyncWriteExt, BufReader, split},
     net::{TcpListener, TcpStream, UdpSocket},
-    sync::{Mutex, mpsc},
+    sync::{Mutex, Semaphore, mpsc, oneshot},
     time::MissedTickBehavior,
 };
 use tokio_rustls::TlsAcceptor;
-use tracing::{debug, error, info, warn};
+use tracing::{debug, info, warn};
 
 use crate::{
     GLOBAL_CONFIG,
-    device::DeviceId,
+    device::{Device, DeviceId},
     plugin_config,
     protocol::{Identity, PacketType, ProtocolPacket},
 };
@@ -41,6 +40,62 @@ pub const BROADCAST_ADDR: SocketAddr =
 /// connection that generated them, preventing stale disconnects from
 /// incorrectly wiping a newer live connection out of `writer_map`.
 static CONN_COUNTER: AtomicU64 = AtomicU64::new(0);
+const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(15);
+static HANDSHAKE_SLOTS: LazyLock<Arc<Semaphore>> = LazyLock::new(|| Arc::new(Semaphore::new(32)));
+
+fn spawn_handshake(future: impl std::future::Future<Output = ()> + Send + 'static) {
+    let Ok(permit) = HANDSHAKE_SLOTS.clone().try_acquire_owned() else {
+        warn!("handshake capacity reached; dropping connection");
+        return;
+    };
+    tokio::spawn(async move {
+        let _permit = permit;
+        if tokio::time::timeout(HANDSHAKE_TIMEOUT, future)
+            .await
+            .is_err()
+        {
+            warn!("identity/TLS handshake timed out");
+        }
+    });
+}
+
+async fn read_identity(
+    stream: &mut (impl tokio::io::AsyncRead + Unpin),
+) -> anyhow::Result<Identity> {
+    // Read exactly through the newline so TLS bytes remain on the socket.
+    let mut raw = Vec::new();
+    loop {
+        let byte = stream.read_u8().await?;
+        anyhow::ensure!(raw.len() < 65536, "identity line too long");
+        if byte == b'\n' {
+            break;
+        }
+        raw.push(byte);
+    }
+    let packet = ProtocolPacket::from_raw(&raw)?;
+    anyhow::ensure!(
+        matches!(packet.packet_type, PacketType::Identity),
+        "expected identity packet"
+    );
+    let identity: Identity = serde_json::from_value(packet.body)?;
+    DeviceId(identity.device_id.clone()).validate()?;
+    Ok(identity)
+}
+
+pub(crate) fn verify_payload_peer(
+    device: &Device,
+    certificates: Option<&[rustls::pki_types::CertificateDer<'_>]>,
+) -> anyhow::Result<()> {
+    let expected = device.payload_certificate()?;
+    let actual = certificates
+        .and_then(|certs| certs.first())
+        .ok_or_else(|| anyhow::anyhow!("payload peer supplied no certificate"))?;
+    anyhow::ensure!(
+        actual.as_ref() == expected,
+        "payload peer certificate mismatch"
+    );
+    Ok(())
+}
 
 #[derive(Debug)]
 pub enum TransportEvent {
@@ -48,11 +103,14 @@ pub enum TransportEvent {
         addr: SocketAddr,
         id: DeviceId,
         raw: String,
+        conn_id: u64,
     },
     NewConnection {
         addr: SocketAddr,
         id: DeviceId,
         name: String,
+        certificate: Vec<u8>,
+        accepted: oneshot::Sender<bool>,
         write_tx: mpsc::UnboundedSender<ProtocolPacket>,
         /// Unique ID for this connection instance.
         conn_id: u64,
@@ -67,9 +125,12 @@ pub enum TransportEvent {
 /// Build a raw `kdeconnect.identity` packet ready to write to a socket.
 /// Used for both pre-TLS and post-TLS identity exchange on both transports.
 fn identity_raw(identity: &Identity) -> Vec<u8> {
-    ProtocolPacket::new(PacketType::Identity, serde_json::to_value(identity).unwrap())
-        .as_raw()
-        .expect("Failed to serialize identity packet")
+    ProtocolPacket::new(
+        PacketType::Identity,
+        serde_json::to_value(identity).unwrap(),
+    )
+    .as_raw()
+    .expect("Failed to serialize identity packet")
 }
 
 /// Completes the identity/TLS handshake once a TCP stream to the peer exists
@@ -102,6 +163,16 @@ async fn complete_handshake(
             return;
         }
     };
+    let Some(certificate) = tls_stream
+        .get_ref()
+        .1
+        .peer_certificates()
+        .and_then(|certs| certs.first())
+        .map(|cert| cert.as_ref().to_vec())
+    else {
+        warn!("control peer supplied no certificate");
+        return;
+    };
     info!(peer = ?peer, device_id = ?id, "[handshake] TLS established");
 
     // Filter capabilities based on per-device disabled plugins so the phone
@@ -118,25 +189,29 @@ async fn complete_handshake(
     let write_rx = Arc::new(Mutex::new(write_rx));
     let conn_id = CONN_COUNTER.fetch_add(1, Ordering::Relaxed);
 
-    tokio::spawn(handle_connection(
-        event_tx.clone(),
-        reader,
-        writer,
-        write_rx,
-        peer,
-        id.clone(),
-        conn_id,
-    ));
-
-    if let Err(e) = event_tx.send(TransportEvent::NewConnection {
-        addr: peer,
-        id,
-        name,
-        write_tx,
-        conn_id,
-    }) {
-        error!(peer = ?peer, "[handshake] transport event channel closed: {}", e);
+    let (accepted, acceptance) = oneshot::channel();
+    if event_tx
+        .send(TransportEvent::NewConnection {
+            addr: peer,
+            id: id.clone(),
+            name,
+            certificate,
+            accepted,
+            write_tx,
+            conn_id,
+        })
+        .is_err()
+    {
+        return;
     }
+    // Do not start reading packets until core has verified the certificate and
+    // registered this connection. This also prevents pre-registration events.
+    if acceptance.await != Ok(true) {
+        return;
+    }
+    tokio::spawn(handle_connection(
+        event_tx, reader, writer, write_rx, peer, id, conn_id,
+    ));
 }
 
 /// Enable TCP keepalive so the OS detects a dead connection within ~60s
@@ -188,91 +263,41 @@ impl TcpTransport {
         let listener = TcpListener::from_std(std::net::TcpListener::from(socket))?;
         info!("TCP listener bound to {}", self.listen_addr);
 
+        self.accept_connections(listener).await
+    }
+
+    async fn accept_connections(&self, listener: TcpListener) -> anyhow::Result<()> {
         loop {
             match listener.accept().await {
                 Ok((mut stream, peer)) => {
                     info!(peer = ?peer, "[tcp] new connection");
                     apply_keepalive(&stream);
 
-                    // Read phone's pre-TLS identity. Read byte-by-byte to avoid
-                    // BufReader consuming TLS ClientHello bytes into its internal
-                    // buffer, which would cause "tls handshake eof".
-                    debug!(peer = ?peer, "[tcp] reading pre-TLS identity");
-                    let buffer = {
-                        let mut raw = Vec::new();
-                        let mut byte = [0u8; 1];
-                        loop {
-                            match stream.read(&mut byte).await {
-                                Ok(0) => {
-                                    warn!(peer = ?peer, "[tcp] EOF reading identity");
-                                    break;
-                                }
-                                Ok(_) => {
-                                    raw.push(byte[0]);
-                                    if byte[0] == b'\n' { break; }
-                                    if raw.len() > 65536 {
-                                        warn!(peer = ?peer, "[tcp] identity line too long");
-                                        break;
-                                    }
-                                }
-                                Err(e) => {
-                                    warn!(peer = ?peer, "[tcp] failed to read identity line: {}", e);
-                                    break;
-                                }
+                    let identity = self.identity.clone();
+                    let server_config = self.server_config.clone();
+                    let event_tx = self.event_tx.clone();
+                    spawn_handshake(async move {
+                        let peer_identity = match read_identity(&mut stream).await {
+                            Ok(identity) => identity,
+                            Err(e) => {
+                                warn!(?peer, "invalid pre-TLS identity: {}", e);
+                                return;
                             }
+                        };
+                        if identity.device_id == peer_identity.device_id {
+                            return;
                         }
-                        String::from_utf8_lossy(&raw).into_owned()
-                    };
-                    debug!(peer = ?peer, "[tcp] read {} bytes", buffer.len());
-
-                    let packet = match serde_json::from_str::<ProtocolPacket>(&buffer) {
-                        Ok(p) => p,
-                        Err(e) => {
-                            warn!(peer = ?peer, "[tcp] failed to parse identity packet: {}", e);
-                            continue;
-                        }
-                    };
-                    let peer_identity = match serde_json::from_value::<Identity>(packet.body) {
-                        Ok(i) => i,
-                        Err(e) => {
-                            warn!(peer = ?peer, "[tcp] failed to parse identity body: {}", e);
-                            // Complete the TLS handshake gracefully so the phone doesn't see
-                            // an abrupt TCP drop and retry aggressively causing connection churn.
-                            match TlsAcceptor::from(self.server_config.clone())
-                                .accept(stream)
-                                .await
-                            {
-                                Ok(mut tls_stream) => {
-                                    let _ = tls_stream.shutdown().await;
-                                }
-                                Err(tls_e) => {
-                                    warn!(peer = ?peer, "[tcp] TLS cleanup after identity error failed: {}", tls_e);
-                                }
-                            }
-                            continue;
-                        }
-                    };
-
-                    let name = peer_identity.device_name.clone();
-                    let id = peer_identity.device_id.clone();
-                    info!(peer = ?peer, device_id = ?id, device_name = name, "[tcp] identified peer");
-
-                    if self.identity.device_id == peer_identity.device_id {
-                        warn!(peer = ?peer, device_id = ?id, "skipping the same device");
-                        continue;
-                    }
-
-                    // Identity exchange + TLS is spawned so a slow or stalled
-                    // peer can't block the accept loop from handling others.
-                    tokio::spawn(complete_handshake(
-                        stream,
-                        self.identity.clone(),
-                        self.server_config.clone(),
-                        peer,
-                        DeviceId(id),
-                        name,
-                        self.event_tx.clone(),
-                    ));
+                        complete_handshake(
+                            stream,
+                            identity,
+                            server_config,
+                            peer,
+                            DeviceId(peer_identity.device_id),
+                            peer_identity.device_name,
+                            event_tx,
+                        )
+                        .await;
+                    });
                 }
                 Err(e) => {
                     warn!("[tcp] accept error: {}", e);
@@ -309,11 +334,17 @@ impl UdpTransport {
                             tracing::error!(
                                 "UDP port {} still in use after {} attempts — \
                                  another instance may be running, exiting: {}",
-                                config.listen_addr.port(), attempts, e
+                                config.listen_addr.port(),
+                                attempts,
+                                e
                             );
                             std::process::exit(1);
                         }
-                        tracing::warn!("UDP bind failed (attempt {}), retrying in 1s: {}", attempts, e);
+                        tracing::warn!(
+                            "UDP bind failed (attempt {}), retrying in 1s: {}",
+                            attempts,
+                            e
+                        );
                         tokio::time::sleep(std::time::Duration::from_secs(1)).await;
                     }
                 }
@@ -392,6 +423,9 @@ impl UdpTransport {
                     }
 
                     let id = DeviceId(peer_identity.device_id.clone());
+                    if id.validate().is_err() {
+                        continue;
+                    }
                     let name = peer_identity.device_name.clone();
 
                     if let Some(new_port) = peer_identity.tcp_port {
@@ -404,7 +438,7 @@ impl UdpTransport {
                     let identity = self.identity.clone();
                     let server_config = self.server_config.clone();
                     let event_tx = self.event_tx.clone();
-                    tokio::spawn(async move {
+                    spawn_handshake(async move {
                         let stream = match TcpStream::connect(peer).await {
                             Ok(s) => {
                                 apply_keepalive(&s);
@@ -415,8 +449,16 @@ impl UdpTransport {
                                 return;
                             }
                         };
-                        complete_handshake(stream, identity, server_config, peer, id, name, event_tx)
-                            .await;
+                        complete_handshake(
+                            stream,
+                            identity,
+                            server_config,
+                            peer,
+                            id,
+                            name,
+                            event_tx,
+                        )
+                        .await;
                     });
                 }
                 Err(e) => {
@@ -442,69 +484,47 @@ async fn handle_connection<R, W>(
     let mut reader = BufReader::new(reader);
     let mut buffer = String::new();
 
-    // Reader task — forwards packets and emits Disconnected when the connection ends.
-    let event_tx_reader = event_tx.clone();
-    let id_reader = id.clone();
-    tokio::spawn(async move {
+    let read = async {
         loop {
             match reader.read_line(&mut buffer).await {
-                Ok(0) => {
-                    warn!(peer = ?peer, "[reader loop] connection closed");
-                    break;
-                }
+                Ok(0) => break,
                 Ok(_) => {
                     let trimmed = buffer.trim();
-                    if trimmed.is_empty() {
-                        buffer.clear();
-                        continue;
-                    }
-
-                    // we should not print raw packets since they might expose
-                    // sensitive data eg. from sms
-                    // eprintln!("[reader] raw bytes from {}: {:?}", peer, trimmed);
-
-                    if let Err(e) = event_tx_reader.send(TransportEvent::IncomingPacket {
-                        addr: peer,
-                        id: id_reader.clone(),
-                        raw: trimmed.to_string(),
-                    }) {
-                        error!(peer = ?peer, "[reader loop] transport event channel closed: {}", e);
+                    if !trimmed.is_empty()
+                        && event_tx
+                            .send(TransportEvent::IncomingPacket {
+                                addr: peer,
+                                id: id.clone(),
+                                raw: trimmed.to_string(),
+                                conn_id,
+                            })
+                            .is_err()
+                    {
                         break;
                     }
+                    buffer.clear();
                 }
                 Err(e) => {
-                    error!(peer = ?peer, "[reader loop] error reading: {}", e);
+                    warn!(?peer, "control read failed: {}", e);
                     break;
                 }
             }
-            buffer.clear();
         }
-        warn!(peer = ?peer, "reader loop ended");
-        // Notify core the connection is dead. conn_id lets core distinguish this
-        // disconnect from a stale event belonging to a previous connection.
-        let _ = event_tx_reader.send(TransportEvent::Disconnected {
-            id: id_reader,
-            conn_id,
-        });
-    });
-
-    // Writer task — drains the write channel and sends packets to the peer.
-    tokio::spawn(async move {
+    };
+    let write = async {
         while let Some(msg) = write_rx.lock().await.recv().await {
-            debug!(peer = ?peer, packet_type = ?msg.packet_type, "writing");
-
-            if let Err(e) = writer.write_all(&msg.as_raw().unwrap()).await {
-                error!(peer = ?peer, "Error writing: {}", e);
+            let Ok(raw) = msg.as_raw() else {
                 break;
-            }
-            if let Err(e) = writer.flush().await {
-                error!(peer = ?peer, "Error flushing: {}", e);
+            };
+            if writer.write_all(&raw).await.is_err() || writer.flush().await.is_err() {
                 break;
             }
         }
-        let _ = writer.shutdown().await;
-        info!(peer = ?peer, "writer task ended");
-    });
+    };
+    // Dropping a superseded writer also ends its reader; no stale connection
+    // remains able to deliver packets after a replacement or local disconnect.
+    tokio::select! { _ = read => {}, _ = write => {} }
+    let _ = event_tx.send(TransportEvent::Disconnected { id, conn_id });
 }
 
 /// Build a filtered identity for a specific device, removing capabilities
@@ -556,11 +576,15 @@ async fn filtered_identity_for_device(device_id: &str) -> Identity {
         device_type: base.device_type,
         protocol_version: base.protocol_version,
         tcp_port: base.tcp_port,
-        incoming_capabilities: base.incoming_capabilities.iter()
+        incoming_capabilities: base
+            .incoming_capabilities
+            .iter()
             .filter(|c| !remove_inc.contains(c.as_str()))
             .cloned()
             .collect(),
-        outgoing_capabilities: base.outgoing_capabilities.iter()
+        outgoing_capabilities: base
+            .outgoing_capabilities
+            .iter()
             .filter(|c| !remove_out.contains(c.as_str()))
             .cloned()
             .collect(),
@@ -579,9 +603,9 @@ pub(crate) async fn prepare_listener_for_payload() -> Result<TcpListener, String
 }
 
 pub(crate) async fn receive_payload(
-    domain: &DeviceId,
+    device: &Device,
     addr: &SocketAddr,
-    temp_file: &PathBuf,
+    save_path: &mut tokio::fs::File,
 ) -> anyhow::Result<()> {
     let config = GLOBAL_CONFIG.get().unwrap();
     let client_config = config.key_store.client_config.clone();
@@ -589,7 +613,7 @@ pub(crate) async fn receive_payload(
 
     let stream = TcpStream::connect(&addr).await?;
 
-    let domain = ServerName::try_from(domain.0.as_str())?.to_owned();
+    let domain = ServerName::try_from(device.device_id.0.as_str())?.to_owned();
 
     let mut stream = tokio_rustls::TlsConnector::from(client_config)
         .connect(domain, stream)
@@ -597,8 +621,8 @@ pub(crate) async fn receive_payload(
 
     debug!("connected");
 
-    let mut save_path = tokio::fs::File::create(&temp_file).await?;
-    tokio::io::copy(&mut stream, &mut save_path).await?;
+    verify_payload_peer(device, stream.get_ref().1.peer_certificates())?;
+    tokio::io::copy(&mut stream, save_path).await?;
     save_path.flush().await?;
     stream.flush().await?;
     stream.shutdown().await?;
@@ -606,4 +630,181 @@ pub(crate) async fn receive_payload(
     info!("successfully received payload");
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::crypto::{NoCertificateVerification, certificate_generator};
+    use crate::device::PairState;
+    use rustls::pki_types::{CertificateDer, PrivateKeyDer, pem::PemObject};
+
+    fn tls_configs() -> (
+        Arc<rustls::ServerConfig>,
+        Arc<rustls::ClientConfig>,
+        Vec<u8>,
+    ) {
+        let key = rcgen::KeyPair::generate().unwrap().serialize_pem();
+        let cert = certificate_generator(&key, "phone").unwrap();
+        let der = cert.der().to_vec();
+        let key = PrivateKeyDer::from_pem_slice(key.as_bytes()).unwrap();
+        let provider = Arc::new(rustls::crypto::aws_lc_rs::default_provider());
+        let verifier = Arc::new(NoCertificateVerification::new((*provider).clone()));
+        let server = rustls::ServerConfig::builder_with_provider(provider.clone())
+            .with_safe_default_protocol_versions()
+            .unwrap()
+            .with_client_cert_verifier(verifier.clone())
+            .with_single_cert(vec![CertificateDer::from(der.clone())], key.clone_key())
+            .unwrap();
+        let client = rustls::ClientConfig::builder_with_provider(provider)
+            .with_safe_default_protocol_versions()
+            .unwrap()
+            .dangerous()
+            .with_custom_certificate_verifier(verifier)
+            .with_client_auth_cert(vec![CertificateDer::from(der.clone())], key)
+            .unwrap();
+        (Arc::new(server), Arc::new(client), der)
+    }
+
+    #[tokio::test]
+    async fn payload_pin_is_checked_in_both_tls_directions() {
+        let (server_config, _, server_cert) = tls_configs();
+        let (_, client_config, client_cert) = tls_configs();
+        let (server_socket, client_socket) = tokio::io::duplex(16384);
+        let acceptor = TlsAcceptor::from(server_config);
+        let connector = tokio_rustls::TlsConnector::from(client_config);
+        let (server, client) = tokio::join!(
+            acceptor.accept(server_socket),
+            connector.connect(ServerName::try_from("phone").unwrap(), client_socket),
+        );
+        let server = server.unwrap();
+        let client = client.unwrap();
+        let expected_client = Device {
+            pair_state: PairState::Paired,
+            paired_certificate: Some(client_cert),
+            ..Device::default()
+        };
+        let expected_server = Device {
+            pair_state: PairState::Paired,
+            paired_certificate: Some(server_cert),
+            ..Device::default()
+        };
+        assert!(
+            verify_payload_peer(&expected_client, server.get_ref().1.peer_certificates()).is_ok()
+        );
+        assert!(
+            verify_payload_peer(&expected_server, client.get_ref().1.peer_certificates()).is_ok()
+        );
+        assert!(
+            verify_payload_peer(&expected_server, server.get_ref().1.peer_certificates()).is_err()
+        );
+        assert!(
+            verify_payload_peer(&expected_client, client.get_ref().1.peer_certificates()).is_err()
+        );
+        assert!(verify_payload_peer(&expected_client, None).is_err());
+        assert!(
+            verify_payload_peer(&Device::default(), server.get_ref().1.peer_certificates())
+                .is_err()
+        );
+    }
+
+    fn identity() -> Identity {
+        Identity {
+            device_id: "desktop".into(),
+            device_name: "desktop".into(),
+            device_type: crate::protocol::DeviceType::Desktop,
+            protocol_version: crate::protocol::PROTOCOL_VERSION,
+            tcp_port: Some(1716),
+            incoming_capabilities: vec![],
+            outgoing_capabilities: vec![],
+        }
+    }
+
+    #[tokio::test]
+    async fn identity_reader_does_not_consume_tls_bytes() {
+        let mut input = identity_raw(&identity());
+        input.extend_from_slice(b"TLS bytes");
+        let mut input = input.as_slice();
+        assert_eq!(
+            read_identity(&mut input).await.unwrap().device_id,
+            "desktop"
+        );
+        assert_eq!(input, b"TLS bytes");
+        let mut invalid = identity();
+        invalid.device_id = "../escape".into();
+        assert!(
+            read_identity(&mut identity_raw(&invalid).as_slice())
+                .await
+                .is_err()
+        );
+        assert!(
+            read_identity(&mut b"{not json}\n".as_slice())
+                .await
+                .is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn identity_length_is_bounded() {
+        let bytes = vec![b'x'; 65537];
+        let error = read_identity(&mut bytes.as_slice()).await.unwrap_err();
+        assert!(error.to_string().contains("too long"));
+    }
+
+    #[tokio::test]
+    async fn silent_client_does_not_block_next_connection() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let transport = TcpTransport {
+            listen_addr: addr,
+            event_tx: tx,
+            identity: Arc::new(identity()),
+            server_config: tls_configs().0,
+        };
+        let listener_task =
+            tokio::spawn(async move { transport.accept_connections(listener).await });
+        let mut silent = TcpStream::connect(addr).await.unwrap();
+        let mut second = TcpStream::connect(addr).await.unwrap();
+        second.write_all(b"{invalid}\n").await.unwrap();
+        let mut byte = [0];
+        // The second client is accepted and rejected promptly while the first
+        // is still withholding its identity; the old listener stalled here.
+        let read = tokio::time::timeout(Duration::from_secs(2), second.read(&mut byte)).await;
+        assert_eq!(read.unwrap().unwrap(), 0);
+        let expired = tokio::time::timeout(
+            HANDSHAKE_TIMEOUT + Duration::from_secs(2),
+            silent.read(&mut byte),
+        )
+        .await;
+        listener_task.abort();
+        let _ = listener_task.await;
+        assert_eq!(expired.unwrap().unwrap(), 0);
+    }
+
+    #[tokio::test]
+    async fn closing_writer_ends_reader_and_reports_connection_id() {
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let (writer_tx, writer_rx) = mpsc::unbounded_channel();
+        let (_peer, stream) = tokio::io::duplex(1024);
+        let (reader, writer) = split(stream);
+        let task = tokio::spawn(handle_connection(
+            tx,
+            reader,
+            writer,
+            Arc::new(Mutex::new(writer_rx)),
+            "127.0.0.1:1716".parse().unwrap(),
+            DeviceId("phone".into()),
+            42,
+        ));
+        drop(writer_tx);
+        tokio::time::timeout(Duration::from_secs(1), task)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(matches!(
+            rx.recv().await,
+            Some(TransportEvent::Disconnected { conn_id: 42, .. })
+        ));
+    }
 }

@@ -59,8 +59,12 @@ impl SmsAttachment {
 }
 
 impl SmsMessages {
-    pub async fn received_packet(&self, tx: mpsc::UnboundedSender<ConnectionEvent>) {
-        let event = ConnectionEvent::SmsMessages(self.clone());
+    pub async fn received_packet(
+        &self,
+        device_id: crate::device::DeviceId,
+        tx: mpsc::UnboundedSender<ConnectionEvent>,
+    ) {
+        let event = ConnectionEvent::SmsMessages((device_id, self.clone()));
         let _ = tx.send(event);
     }
 }
@@ -102,15 +106,19 @@ impl SmsAttachmentFile {
         device: &crate::device::Device,
         info: &crate::protocol::PacketPayloadTransferInfo,
     ) -> anyhow::Result<std::path::PathBuf> {
+        device.device_id.validate()?;
+        crate::download::validate_filename(&self.filename)?;
         let cache_dir = attachments_dir(&device.device_id.0);
         tokio::fs::create_dir_all(&cache_dir).await?;
-        let dest = cache_dir.join(&self.filename);
+        let download = crate::download::Download::new(&cache_dir, &self.filename)?;
+        let mut file = download.writer()?;
 
         let mut remote_addr = device.address;
         remote_addr.set_port(info.port);
 
-        crate::transport::receive_payload(&device.device_id, &remote_addr, &dest).await?;
-        Ok(dest)
+        crate::transport::receive_payload(device, &remote_addr, &mut file).await?;
+        drop(file);
+        download.finish(false)
     }
 }
 

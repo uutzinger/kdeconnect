@@ -394,7 +394,7 @@ fn view_messages_list<'a>(
         );
     } else {
         let total = app.messages.len();
-        let hidden = total.saturating_sub(app.messages_window_size);
+        let hidden = super::app::message_window_start(total, app.messages_window_size);
 
         // If there are older messages not currently rendered, show a control
         // to load more. This keeps long threads responsive by avoiding a full
@@ -411,7 +411,7 @@ fn view_messages_list<'a>(
             );
         }
 
-        for msg in app.messages.iter().take(app.messages_window_size) {
+        for msg in app.messages.iter().skip(hidden) {
             messages_column = messages_column.push(view_message_bubble(app, msg, spacing));
         }
     }

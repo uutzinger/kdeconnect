@@ -179,7 +179,9 @@ impl PluginRegistry {
                         "Successfully parsed {} SMS messages",
                         sms_messages.messages.len()
                     );
-                    sms_messages.received_packet(connection_tx).await;
+                    sms_messages
+                        .received_packet(device.device_id.clone(), connection_tx)
+                        .await;
                 } else {
                     warn!("Failed to parse SMS messages packet: {:?}", body);
                 }
@@ -426,11 +428,16 @@ impl PluginRegistry {
     /// background task so the event loop is never blocked.
     pub async fn send_payload(
         &self,
+        device: Device,
         packet: ProtocolPacket,
         device_writer: &mpsc::UnboundedSender<ProtocolPacket>,
         mut payload: TransferAdapter<impl AsyncRead + Sync + Send + Unpin + 'static>,
         payload_size: u64,
     ) {
+        if let Err(e) = device.payload_certificate() {
+            warn!("refusing payload to unauthenticated device: {}", e);
+            return;
+        }
         info!("preparing payload transfer");
 
         let free_listener = match prepare_listener_for_payload().await {
@@ -507,6 +514,13 @@ impl PluginRegistry {
                 }
             };
 
+            if let Err(e) = crate::transport::verify_payload_peer(
+                &device,
+                stream.get_ref().1.peer_certificates(),
+            ) {
+                warn!("[payload] rejecting peer: {}", e);
+                return;
+            }
             debug!("[payload] TLS accepted, copying payload");
             let _ = tokio::io::copy(&mut payload, &mut stream).await;
             let _ = stream.flush().await;

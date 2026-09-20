@@ -23,6 +23,7 @@ pub enum CoreEvent {
     DevicePairStateChanged((DeviceId, PairState)),
     PacketReceived {
         device: DeviceId,
+        conn_id: u64,
         packet: ProtocolPacket,
     },
     SendPacket {
@@ -79,7 +80,7 @@ pub enum ConnectionEvent {
     StateUpdated(DeviceState),
     PairStateChanged((DeviceId, PairState)),
     Mpris((DeviceId, Mpris)),
-    SmsMessages(SmsMessages),
+    SmsMessages((DeviceId, SmsMessages)),
     ContactsReceived(HashMap<String, String>),
     UpdateTransferProgress(u8),
     /// Phone sent pair:true and is waiting for user decision.

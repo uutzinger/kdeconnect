@@ -112,12 +112,11 @@ impl ShareRequest {
             PathBuf::from("/tmp")
         });
 
-        // Avoid overwriting existing files by appending a counter if needed.
-        let dest = unique_path(&download_dir, &request.filename);
+        let download = crate::download::Download::new(&download_dir, &request.filename)?;
+        let mut file = download.writer()?;
 
         let mut remote_addr = device.address;
         remote_addr.set_port(info.port);
-        let domain = device.device_id.clone();
 
         info!(
             "[share] receiving '{}' from {} ({}:{})",
@@ -127,13 +126,16 @@ impl ShareRequest {
             info.port
         );
 
-        if let Err(e) = receive_payload(&domain, &remote_addr, &dest).await {
+        if let Err(e) = receive_payload(device, &remote_addr, &mut file).await {
             warn!(
                 "[share] receive_payload failed for '{}': {}",
                 request.filename, e
             );
             return Err(e);
         }
+
+        drop(file);
+        let dest = download.finish(true)?;
 
         info!("[share] saved '{}' to {:?}", request.filename, dest);
 
@@ -153,32 +155,6 @@ impl ShareRequest {
     }
 }
 
-/// Returns a path that doesn't already exist by appending ` (N)` before the
-/// extension — e.g. `photo (1).jpg`, `photo (2).jpg`.
-fn unique_path(dir: &PathBuf, filename: &str) -> PathBuf {
-    let candidate = dir.join(filename);
-    if !candidate.exists() {
-        return candidate;
-    }
-
-    let stem = PathBuf::from(filename)
-        .file_stem()
-        .map(|s| s.to_string_lossy().into_owned())
-        .unwrap_or_else(|| filename.to_string());
-    let ext = PathBuf::from(filename)
-        .extension()
-        .map(|e| format!(".{}", e.to_string_lossy()))
-        .unwrap_or_default();
-
-    for i in 1u32.. {
-        let candidate = dir.join(format!("{} ({}){}", stem, i, ext));
-        if !candidate.exists() {
-            return candidate;
-        }
-    }
-
-    dir.join(filename)
-}
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct ShareRequestFile {

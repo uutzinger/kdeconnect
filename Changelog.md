@@ -2,7 +2,7 @@
 
 ## Changes made
 
-Implemented the SMS performance fixes, hardened `kdeconnect-core`/`kdeconnect-service` against panics and zombie processes, and deployed the new build.
+Implemented SMS performance fixes, hardened `kdeconnect-core`/`kdeconnect-service` against panics and zombie processes, and deployed the new build.
 
 ### `kdeconnect-core/src/lib.rs`
 - `CoreEvent::PacketReceived` now drops any non-pair packet from a device whose `pair_state != Paired` before dispatching to plugins. Previously an unpaired peer that merely completed the TLS handshake could reach `run_command`'s execute-by-key handler.

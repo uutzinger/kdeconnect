@@ -22,6 +22,19 @@ const DAEMON_PATH: &str = "/io/github/hepp3n/kdeconnect/Daemon";
 const SMS_PATH: &str = "/io/github/hepp3n/kdeconnect/Sms";
 const CONTACTS_PATH: &str = "/io/github/hepp3n/kdeconnect/Contacts";
 
+pub(crate) type SmsCache = Arc<Mutex<HashMap<String, Arc<str>>>>;
+
+pub(crate) async fn cached_sms(cache: &SmsCache, device_id: &str) -> Option<Arc<str>> {
+    cache.lock().await.get(device_id).cloned()
+}
+
+async fn cache_sms(cache: &SmsCache, device_id: &str, messages_json: &str) {
+    cache
+        .lock()
+        .await
+        .insert(device_id.to_owned(), Arc::from(messages_json));
+}
+
 /// Simplified device info for D-Bus
 #[derive(
     Debug,
@@ -599,14 +612,14 @@ impl DaemonInterface {
 /// SMS-specific D-Bus interface
 pub struct SmsInterface {
     event_sender: Arc<mpsc::UnboundedSender<AppEvent>>,
-    sms_cache: Arc<Mutex<Option<Arc<str>>>>,
+    sms_cache: SmsCache,
 }
 
 #[interface(name = "io.github.hepp3n.kdeconnect.Sms")]
 impl SmsInterface {
     /// Return cached SMS JSON — in-memory first, disk fallback, empty if neither
     async fn get_cached_sms(&self, device_id: String) -> String {
-        if let Some(json) = self.sms_cache.lock().await.as_ref() {
+        if let Some(json) = cached_sms(&self.sms_cache, &device_id).await {
             debug!("Returning in-memory SMS cache ({} bytes)", json.len());
             return json.to_string();
         }
@@ -712,6 +725,7 @@ impl SmsInterface {
     #[zbus(signal)]
     async fn sms_messages_received(
         signal_emitter: &SignalEmitter<'_>,
+        device_id: String,
         messages_json: String,
     ) -> zbus::Result<()>;
 
@@ -721,6 +735,7 @@ impl SmsInterface {
     #[zbus(signal)]
     async fn sms_attachment_received(
         signal_emitter: &SignalEmitter<'_>,
+        device_id: String,
         filename: String,
         path: String,
     ) -> zbus::Result<()>;
@@ -782,7 +797,7 @@ pub struct KdeConnectService {
     connection: Connection,
     event_sender: Arc<mpsc::UnboundedSender<AppEvent>>,
     devices: Arc<Mutex<HashMap<String, DbusDevice>>>,
-    sms_cache: Arc<Mutex<Option<Arc<str>>>>,
+    sms_cache: SmsCache,
     clipboard: Option<ClipboardHandle>,
 }
 
@@ -848,6 +863,24 @@ impl KdeConnectService {
         // the phone link) is gone they would only go stale.
         kdeconnect_core::plugins::sftp::unmount_all().await;
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{SmsCache, cache_sms, cached_sms};
+    use std::{collections::HashMap, sync::Arc};
+    use tokio::sync::Mutex;
+
+    #[tokio::test]
+    async fn sms_cache_is_scoped_by_device() {
+        let cache: SmsCache = Arc::new(Mutex::new(HashMap::new()));
+        cache_sms(&cache, "phone-a", r#"{"messages":[{"_id":1}]}"#).await;
+        cache_sms(&cache, "phone-b", r#"{"messages":[{"_id":2}]}"#).await;
+
+        assert!(cached_sms(&cache, "missing").await.is_none());
+        assert!(cached_sms(&cache, "phone-a").await.unwrap().contains("\"_id\":1"));
+        assert!(cached_sms(&cache, "phone-b").await.unwrap().contains("\"_id\":2"));
     }
 }
 impl KdeConnectService {
@@ -922,7 +955,7 @@ impl KdeConnectService {
             .await?;
         info!("Daemon interface registered at {}", DAEMON_PATH);
 
-        let sms_cache: Arc<Mutex<Option<Arc<str>>>> = Arc::new(Mutex::new(None));
+        let sms_cache: SmsCache = Arc::new(Mutex::new(HashMap::new()));
         let current_device_id: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
 
         let sms_interface = SmsInterface {
@@ -1044,7 +1077,7 @@ impl KdeConnectService {
         event: ConnectionEvent,
         devices: &Arc<Mutex<HashMap<String, DbusDevice>>>,
         event_sender: &Arc<mpsc::UnboundedSender<AppEvent>>,
-        sms_cache: &Arc<Mutex<Option<Arc<str>>>>,
+        sms_cache: &SmsCache,
         current_device_id: &Arc<Mutex<Option<String>>>,
         broadcast_tx: &broadcast::Sender<crate::varlink_server::VarlinkEvent>,
     ) -> Result<()> {
@@ -1116,10 +1149,10 @@ impl KdeConnectService {
                         }
                     }
 
-                    if sms_cache.lock().await.is_none() {
+                    if !sms_cache.lock().await.contains_key(&did) {
                         if let Some(cached_sms) = load_sms_cache(&did).await {
-                            *sms_cache.lock().await = Some(Arc::from(cached_sms));
-                            debug!("Seeded in-memory SMS cache from disk on connect");
+                            sms_cache.lock().await.insert(did.clone(), Arc::from(cached_sms));
+                            debug!("Seeded per-device SMS cache from disk on connect");
                         }
                     }
 
@@ -1290,7 +1323,7 @@ impl KdeConnectService {
                 }
                 debug!("PairStateChanged signal emitted for {}", device_id.0);
             }
-            ConnectionEvent::SmsMessages(sms_data) => {
+            ConnectionEvent::SmsMessages((device_id, sms_data)) => {
                 info!(
                     "SMS messages received: {} messages",
                     sms_data.messages.len()
@@ -1299,19 +1332,20 @@ impl KdeConnectService {
                 let messages_json = serde_json::to_string(&sms_data)?;
                 debug!("SMS JSON size: {} bytes", messages_json.len());
 
-                *sms_cache.lock().await = Some(Arc::from(messages_json.as_str()));
-
-                if let Some(did) = current_device_id.lock().await.as_deref() {
-                    save_sms_cache(did, &messages_json).await;
-                }
+                cache_sms(sms_cache, &device_id.0, &messages_json).await;
+                save_sms_cache(&device_id.0, &messages_json).await;
 
                 let iface_ref = connection
                     .object_server()
                     .interface::<_, SmsInterface>(SMS_PATH)
                     .await?;
 
-                SmsInterface::sms_messages_received(iface_ref.signal_emitter(), messages_json)
-                    .await?;
+                SmsInterface::sms_messages_received(
+                    iface_ref.signal_emitter(),
+                    device_id.0,
+                    messages_json,
+                )
+                .await?;
                 debug!("SMS D-Bus signal emitted");
             }
             ConnectionEvent::ContactsReceived(contacts) => {
@@ -1350,7 +1384,7 @@ impl KdeConnectService {
                     .await?;
                 debug!("ContactPhotosReceived D-Bus signal emitted");
             }
-            ConnectionEvent::SmsAttachmentReceived((_device_id, filename, path)) => {
+            ConnectionEvent::SmsAttachmentReceived((device_id, filename, path)) => {
                 info!("SMS attachment received: {} -> {:?}", filename, path);
 
                 let iface_ref = connection
@@ -1360,6 +1394,7 @@ impl KdeConnectService {
 
                 SmsInterface::sms_attachment_received(
                     iface_ref.signal_emitter(),
+                    device_id.0,
                     filename,
                     path.display().to_string(),
                 )
