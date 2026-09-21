@@ -12,10 +12,27 @@ pub struct Conversation {
     pub thread_id: String,
     pub contact_name: String,
     pub phone_number: String,
+    /// All distinct participant addresses seen in this thread (more than
+    /// one for group MMS/RCS), in first-seen order. The KDE Connect
+    /// protocol has no group-name field, so group conversations are named
+    /// from this list.
+    pub addresses: Vec<String>,
     pub last_message: String,
     pub timestamp: i64,
     /// Used for future read/unread tracking
     pub unread: bool,
+}
+
+impl Conversation {
+    /// Display name: the resolved contact/group name when available, the
+    /// primary number otherwise.
+    pub fn display_name(&self) -> String {
+        if self.contact_name.is_empty() {
+            self.phone_number.clone()
+        } else {
+            self.contact_name.clone()
+        }
+    }
 }
 
 /// One MMS attachment on a message. Starts out with just a thumbnail

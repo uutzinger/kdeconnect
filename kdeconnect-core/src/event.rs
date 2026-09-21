@@ -1,6 +1,8 @@
 use std::collections::HashMap;
 use tokio::io::AsyncRead;
 
+use serde::{Deserialize, Serialize};
+
 use crate::{
     device::{Device, DeviceId, DeviceState, PairState},
     plugins::mpris::{Mpris, MprisAction, MprisRequest},
@@ -14,6 +16,41 @@ pub struct RemoteCommand {
     pub key: String,
     pub name: String,
     pub command: String,
+}
+
+/// Direction of a payload transfer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum TransferDirection {
+    Incoming,
+    Outgoing,
+}
+
+/// State of one transfer: in progress, or a terminal result. `Failed`
+/// carries the machine-readable stage (e.g. "connect", "receive",
+/// "size-validation", "destination") and the full error chain as text.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TransferState {
+    Receiving,
+    Completed,
+    Failed { stage: String, reason: String },
+}
+
+/// Structured status of one file/payload transfer, forwarded from the core
+/// through the service to UI clients. Progress updates for the same
+/// `transfer_id` supersede earlier ones.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TransferStatus {
+    pub transfer_id: String,
+    pub device_id: String,
+    pub direction: TransferDirection,
+    pub filename: Option<String>,
+    pub expected_size: Option<u64>,
+    pub received_bytes: u64,
+    pub state: TransferState,
+    /// Final destination, set once `state == Completed`.
+    pub saved_path: Option<String>,
 }
 
 pub enum CoreEvent {
@@ -83,6 +120,10 @@ pub enum ConnectionEvent {
     SmsMessages((DeviceId, SmsMessages)),
     ContactsReceived(HashMap<String, String>),
     UpdateTransferProgress(u8),
+    /// Structured status of an incoming/outgoing payload transfer —
+    /// progress updates and the terminal result. Replaces the bare
+    /// percentage of `UpdateTransferProgress` for incoming transfers.
+    TransferStatus(Box<TransferStatus>),
     /// Phone sent pair:true and is waiting for user decision.
     /// Payload is (device_id, device_name).
     PairingRequested((DeviceId, String)),
@@ -104,4 +145,43 @@ pub enum ConnectionEvent {
     /// the whole way to the UI (same as SMS thumbnails) rather than
     /// decoding here only to re-encode for the D-Bus signal/cache.
     ContactPhotosReceived(HashMap<String, String>),
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{TransferDirection, TransferState, TransferStatus};
+
+    /// The D-Bus/varlink propagation path serializes `TransferStatus` to
+    /// JSON and parses it back on the client — pin that roundtrip.
+    #[test]
+    fn transfer_status_json_roundtrip() {
+        let status = TransferStatus {
+            transfer_id: "abc-0001".into(),
+            device_id: "phone".into(),
+            direction: TransferDirection::Incoming,
+            filename: Some("photo.jpg".into()),
+            expected_size: Some(1024),
+            received_bytes: 512,
+            state: TransferState::Failed {
+                stage: "receive".into(),
+                reason: "transfer stalled".into(),
+            },
+            saved_path: None,
+        };
+
+        let json = serde_json::to_string(&status).unwrap();
+        let back: TransferStatus = serde_json::from_str(&json).unwrap();
+
+        assert_eq!(back.transfer_id, "abc-0001");
+        assert_eq!(back.direction, TransferDirection::Incoming);
+        assert_eq!(back.expected_size, Some(1024));
+        assert_eq!(back.received_bytes, 512);
+        assert_eq!(
+            back.state,
+            TransferState::Failed {
+                stage: "receive".into(),
+                reason: "transfer stalled".into()
+            }
+        );
+    }
 }

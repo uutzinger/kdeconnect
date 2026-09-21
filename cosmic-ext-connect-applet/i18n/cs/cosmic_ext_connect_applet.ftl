@@ -29,6 +29,11 @@ quick-actions-browse-device = Procházet zařízení
 quick-actions-unmount-device = Odpojit zařízení
 quick-actions-run-commands-header = Spustit příkazy
 
+# File transfers (popup)
+transfer-receiving = Přijímání { $name }
+transfer-completed = Přijato { $name }
+transfer-failed = Přenos selhal: { $name }
+
 # Run Command management (settings)
 run-commands-manage-header = Příkazy (spouštěné z telefonu)
 run-commands-add-header = Přidat nový příkaz

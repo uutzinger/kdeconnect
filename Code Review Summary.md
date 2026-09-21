@@ -8,7 +8,6 @@ P1 = high priority. P2 = normal priority. Reviews are ordered oldest first; appe
 
 - [First review - 2026-08-05](#first-review---2026-08-05)
 - [Second review - 2026-09-20](#second-review---2026-09-20)
-- [Incoming image transfer - 2026-09-20](#incoming-image-transfer---2026-09-20)
 
 ## First Review - 2026-08-05
 
@@ -80,102 +79,75 @@ Reviewed source at `ef47cb9`. No live phone or GUI integration testing was perfo
 
 ### SMS Issues
 
-✅ **[P1] Newest messages hidden in long threads**: Fixed by rendering the newest window from the chronologically sorted message list. "Load older messages" now expands toward the older prefix. Covered by a 150-message regression test.
+✅ **[P1] Newest messages hidden in long threads**: Fixed by rendering the newest window from the chronologically sorted message list. "Load older messages" now expands toward the older prefix. Verified by a 150-message regression test.
 
-⏳ **Quadratic duplicate detection remains**: `app.rs:727` scans accumulated messages for every incoming message. Replace repeated linear duplicate checks with indexed lookup while preserving outgoing-echo matching. The first review's batching fix reduced sorting and persistence, but did not eliminate quadratic insertion.
+✅ **[P1] SMS data mixed between devices**: Fixed by carrying device ID through core events and D-Bus message/attachment signals, using a per-device in-memory cache keyed by source device, saving to disk under the source device ID, and filtering events in each SMS window. D-Bus and Varlink cache reads now select only the requested device. Verified by a two-device cache test.
+
+✅ **[P2] Newest messages shown first**: The bounded message view skips the hidden older prefix and renders the most recent messages in chronological order. Increasing the window exposes older messages without hiding new arrivals.
+
+✅ **[P2] SMS windows filter by device**: Message and MMS attachment events include their source device ID. Each SMS window ignores events belonging to other phones.
+
+✅ **[P2] SMS events retain source identity**: `ConnectionEvent::SmsMessages` carries `(DeviceId, SmsMessages)`; the plugin dispatcher attaches the authenticated source device before forwarding the event.
+
+✅ **[P2] Per-device SMS cache**: Replaced the single optional in-memory SMS payload with a map keyed by device ID. Incoming messages update memory and disk using their source ID. D-Bus and Varlink cache reads return only the requested device's data.
+
+✅ **[P2] Device-scoped D-Bus signals**: SMS message and attachment signals include `device_id`; the D-Bus client exposes it in `ServiceEvent`.
+
+✅ **[P2] Quadratic duplicate detection remains**: Fixed. `app.rs` now keeps a `MessageIndex` over the open thread's message list (protocol ID → position, plus body → positions of pending optimistic `sending_*` messages), so duplicate checks and outgoing-echo matching are O(1) per incoming message instead of a full scan. The index is maintained incrementally during a batch and rebuilt after the end-of-batch sort and on optimistic sends; it is cleared with the list on thread switch/delete. Echo matching semantics preserved (same body, type 2, within 300s). Covered by five new unit tests including a sort/rebuild regression test.
+
+✅ **Group SMS names** Root cause found in the user's own caches: the KDE Connect protocol has no group-name field (Android doesn't expose one; Google Messages stores group names privately), so the applet resolved a conversation's name from a single address — the newest message's first address — via an exact digit-only contact lookup. RCS group threads carry an alphanumeric group token as their address, which normalizes to the empty string and collided with a synced "Skype call" contact whose TEL is `+` (also normalizing to ""). Fixed two ways: (1) `Conversation` now keeps the full participant roster (union of all message addresses in the thread) and the display name joins every participant's resolved contact name ("Amy, Clara"), falling back to the raw address; (2) contact lookups now require at least 7 digits (`MIN_LOOKUP_DIGITS`), so degenerate contacts and short-code senders can no longer produce bogus names. Covered by new tests in `utils.rs` and `dbus.rs`.
+
+**SMS Verification**:
+- `cargo test -p cosmic-ext-connect-applet --locked --offline`: 3 passed. The new test confirms a 150-message thread initially renders messages 50 through 149.
+- `cargo test -p kdeconnect-service --locked --offline`: 2 passed, 1 compositor-dependent clipboard test ignored. The new test confirms two phones retain distinct SMS cache values.
 
 ### kdeconnect-core
 
-✅ **[P1] Paired identity can be impersonated**: Fixed by pinning the certificate approved during pairing and checking it on control and payload connections. Packets are bound to their connection ID, and replaced connections are closed. Legacy records without a certificate require re-pairing. See the implementation follow-up for validation.
+✅ **[P1] Paired identity can be impersonated**: Fixed by pinning the certificate approved during pairing and checking it on control and payload connections. Packets are bound to their connection ID, and replaced connections are closed. Legacy records without a certificate require re-pairing.
 
 ✅ **[P1] Received filenames escape destination directories**: Remote names are restricted to a single filename; device IDs are validated before filesystem use. Share and MMS downloads use temporary-file descriptors and atomic publication, with no-clobber collision handling for shared files. Tests cover traversal, symlinks, duplicate names, and cleanup.
 
-✅ **[P1] Silent TCP client blocks inbound connections**: Identity exchange and TLS run in bounded tasks with a 15-second deadline and at most 32 concurrent handshakes across TCP/UDP discovery. Invalid identities are rejected without inline TLS cleanup. The listener regression test checks another connection remains responsive and the silent peer times out.
+✅ **[P1] Silent TCP client blocks inbound connections**: Identity exchange and TLS run in bounded tasks with a 15-second deadline and at most 32 concurrent handshakes across TCP/UDP discovery. Invalid identities are rejected without inline TLS cleanup. Verified by a listener regression test that checks another connection remains responsive while the silent peer times out.
 
-✅ **[P2] Reconnection retains an old network address**: Device loading now refreshes address/name from the current connection while retaining trusted pairing data. Covered by a changed-address test; live phone/network-change validation remains pending under FT-06.
+✅ **[P2] Reconnection retains an old network address**: Device loading now refreshes address/name from the current connection while retaining trusted pairing data. Covered by a changed-address test. Live validation after network changes remains pending under FT-06.
 
-⏳ **[P2] Text and URL shares silently discarded**: `plugin_interface.rs:361-366` requires payload metadata for every share. Require it only for file shares and dispatch body-only text/URL shares normally.
+✅ **[P2] Certificate pinning and pairing persistence**: Approved peer certificates are stored atomically with paired state. Changed certificates are rejected before packet dispatch; payload clients and servers must present the same pinned certificate. Pending approvals are tied to the live connection and reset on reconnect. Local unpair can clear a pin even when certificate mismatch prevents reconnection.
 
-⏳ **[P2] Short payload reported successful**: `transport.rs:581-608` ignores the byte count from `tokio::io::copy` and has no expected-size parameter. Pass the announced payload size, validate received bytes, and publish the file only after validation. The first review's I/O error propagation does not detect clean EOF before the expected size.
+✅ **[P2] Legacy pairing migration**: Records without a pinned certificate load as unpaired and require explicit approval again. No certificate is silently trusted during upgrade. Device metadata is refreshed from the current connection.
 
-### kdeconnect-service
+✅ **[P2] Contained file reception**: Added `download.rs` for basename validation, temporary-file ownership, cleanup, atomic cache replacement, and no-clobber shared-file publication. Updated share, MMS, and album-art payload callers to use open descriptors instead of reopening remote-selected paths.
 
-✅ **[P1] SMS data mixed between devices**: Fixed by carrying device ID through core events and D-Bus message/attachment signals, using a per-device in-memory cache, saving under the source device ID, and filtering events in each SMS window. D-Bus and Varlink cache reads now select only the requested device. Covered by a two-device cache test.
+✅ **[P2] Bounded connection setup**: The entire pre-TLS identity exchange and handshake runs outside the accept loop, limited to 32 concurrent tasks with a 15-second deadline. Connection IDs reject queued stale packets; closing/replacing a writer also closes its reader.
 
-### Verification
+✅ **[P2] Text and URL shares silently discarded**: Fixed. `plugin_interface.rs` no longer requires payload metadata to dispatch a share; `ShareRequest::receive_share` now takes `Option<&PacketPayloadTransferInfo>` and errors only when a file share arrives without transfer info, so body-only text/URL shares are dispatched normally and a malformed file share logs a warning instead of being silently dropped. Verified with `cargo check -p kdeconnect-core`.
 
-✅ **Existing core tests passed**: `cargo test -p kdeconnect-core --lib --locked --offline` completed with 7 passed and 0 failed. These tests cover SFTP helpers, not the open findings above.
+✅ **[P2] Short payload reported successful**: Fixed. `receive_payload` in `transport.rs` now takes the announced `payload_size` (`expected_size: Option<u64>`), compares it against the byte count returned by `tokio::io::copy`, and fails on any mismatch (short or excess), so a clean EOF mid-transfer is reported as an error. Dispatch threads `packet.payload_size` through all three receive paths (share, MMS attachment, MPRIS album art); callers only publish via `Download::finish` after validation passes, and a failed transfer drops the temporary file. Covered by the `payload_size_is_validated` unit test.
 
-✅ **Earlier changes checked in source**: Unpaired-device dispatch gate, payload I/O error propagation, bounded SMS rendering, cached dropdown/search values, batched message processing, and applet child reaping are present. Remaining gaps are listed above; the first review's pending rich-text allocations and best-effort send logging remain open.
+**Core Verification**:
+- `cargo check --workspace --locked --offline` passed. No dependency changes were needed.
+- `cargo test -p kdeconnect-core --lib --locked --offline`: 20 passed, including legacy pairing, stored-pin reload/revocation, mismatched certificates in both TLS payload directions, path traversal, symlinks, duplicate names, temporary-file cleanup, and listener responsiveness/deadline. The loopback socket test requires permission outside the execution sandbox.
+- Existing core tests passed: 7 passed, 0 failed. These tests cover SFTP helpers.
 
-### P1 Core Fixes
+### Transfer and Logging Follow-up
 
-#### kdeconnect-core
+The reported missing image was not reproduced; its historical failure cause remains unknown. The running service's stdout/stderr pointed to `/dev/null` — that logging gap and the transfer findings below are now addressed; only the live-device portions remain pending.
 
-✅ **Certificate pinning and pairing persistence**: Approved peer certificates are stored atomically with paired state. Changed certificates are rejected before packet dispatch; payload clients and servers must present the same pinned certificate. Pending approvals are tied to the live connection and reset on reconnect. Local unpair can clear a pin even when certificate mismatch prevents reconnection.
+✅ **[P2] Preserve transfer diagnostics**: `cosmic-ext-connect-applet/src/main.rs` now routes the spawned service's stdout/stderr into `~/.local/share/kdeconnect/service.log` (one rotation generation at launch, 1 MiB cap) instead of `/dev/null`, and sets `RUST_LOG=info` for the child when the user hasn't chosen a level so transfer diagnostics are retained. `kdeconnect-service/src/main.rs` honors `KDECONNECT_LOG_FILE` on all platforms (not just Flatpak), writing to the same path. Native/Flatpak runtime verification remains pending (no live session restarted here).
 
-✅ **Legacy pairing migration**: Records without a pinned certificate load as unpaired and require explicit approval again. No certificate is silently trusted during upgrade. Device metadata is refreshed from the current connection.
+✅ **[P2] Log transfer stages and rejection reasons**: Every incoming payload transfer now gets a transfer ID (logged and carried in events) with receipt logged at dispatch, stage-tagged errors (`PayloadError.stage`: connect, tls-handshake, verify-peer, receive, size-validation, finalize, plus destination/publish/metadata in the plugins), and `{:#}` full error chains in failure logs. Invalid share bodies and attachment packets missing payload metadata log warnings; no packet bodies, file contents, or credentials are logged. Text/URL sharing stays independent of file metadata.
 
-✅ **Contained file reception**: Added `download.rs` for basename validation, temporary-file ownership, cleanup, atomic cache replacement, and no-clobber shared-file publication. Updated share, MMS, and album-art payload callers to use open descriptors instead of reopening remote-selected paths.
+✅ **[P2] Show incoming transfer status and errors**: Added structured `TransferStatus` events in `kdeconnect-core/src/event.rs` (transfer/device IDs, direction, filename, expected size, received bytes, receiving/completed/failed state with stage+reason, saved path). An `IncomingTransfer` reporter (`filetransfer.rs`) emits throttled progress (200 ms) and exactly one terminal result across all three receive paths (share, MMS attachment, MPRIS album art). The service forwards them as a D-Bus `transfer_status` signal plus a varlink broadcast, keeps a bounded 50-entry recent-results list (`record_transfer_status`, deduped by transfer ID) exposed via D-Bus and varlink `GetRecentTransfers`, and the applet seeds from that list, shows per-device receiving/completed/failed states with progress bars, saved paths, and failure stage/reason in the popup, and keeps its own bounded 20-entry list. Notification failures are logged separately; a saved file remains a successful transfer.
 
-✅ **Bounded connection setup**: The entire pre-TLS identity exchange and handshake runs outside the accept loop, limited to 32 concurrent tasks with a 15-second deadline. Connection IDs reject queued stale packets; closing/replacing a writer also closes its reader.
+✅ **[P2] Add deadlines and size validation**: `receive_payload` in `transport.rs` now enforces a 10 s connection deadline, a 15 s TLS-handshake deadline, and a 30 s read-inactivity deadline via a manual copy loop that only fails when no bytes arrive for the full window — large transfers that keep progressing are unaffected. Failures are stage-tagged (`PayloadError`), and received bytes are validated against the announced `payloadSize` (short and excess both rejected) before the file is published. Covered by copy-loop tests (progress/EOF, stall timeout, slow-but-progressing) and the size-validation test.
 
-#### Verification
+✅ **[P2] Save files safely and report destination failures**: Complete. Share receive now errors with stage "destination" when the Downloads directory is unavailable instead of silently falling back to `/tmp`, and temporary-file creation/opening and final publication carry stage-tagged contextual errors ("destination"/"publish"). MMS attachments get the same staging (unsafe names → "metadata", cache-dir/descriptor failures → "destination", publish failure → "publish"). Reception still goes into a uniquely created temporary file in the destination directory and is published only after size validation passes; partial files are cleaned up on failure.
 
-✅ **Core regression tests**: `cargo test -p kdeconnect-core --lib --locked --offline`: 20 passed, including legacy pairing, stored-pin reload/revocation, mismatched certificates in both TLS payload directions, path traversal, symlinks, duplicate names, temporary-file cleanup, and listener responsiveness/deadline. The loopback socket test requires permission outside the execution sandbox.
+✅ **[P2] Refresh the phone's payload address** (code complete): Already satisfied by the earlier reconnection fix — every new connection rebuilds the `Device` from the current connection address (`lib.rs:307`) while `load_from` refreshes address/name and preserves trusted pairing data (`device.rs:114-115`), and the share/MMS/album-art receive paths all dial that live address. Certificate pinning is unaffected (changed certificates still rejected; active-connection certificate replacement refused). Only the live portion remains: verify file and MMS downloads after DHCP/network changes, covered under Live-device validation.
 
-✅ **Workspace build**: `cargo check --workspace --locked --offline` passed. No dependency changes were needed.
+### Live Validation
 
-⏳ **Live-device validation**: Install/restart the updated service, explicitly re-pair the phone, verify reconnect and changed-certificate rejection, and test incoming/outgoing image transfers. No service was installed or restarted during implementation. Transfer-size validation, transfer status/error reporting, and the other pending review items remain separate work.
+⏳ **[P2] Live-device validation**: Install/restart the updated service, explicitly re-pair the phone, verify reconnect and changed-certificate rejection, and test incoming/outgoing image transfers. No service was installed or restarted during implementation. Transfer-size validation, transfer status/error reporting, and the other pending review items remain separate work.
 
-### P1 SMS Fixes
+⏳ **[P2] Live multi-phone validation**: Install/restart the updated service and verify two paired phones cannot populate each other's SMS window or cache. No service was installed or restarted during this implementation.
 
-#### SMS UI
-
-✅ **Newest messages shown first**: The bounded message view skips the hidden older prefix and renders the most recent messages in chronological order. Increasing the window exposes older messages without hiding new arrivals.
-
-✅ **SMS windows filter by device**: Message and MMS attachment events include their source device ID. Each SMS window ignores events belonging to other phones.
-
-#### kdeconnect-core
-
-✅ **SMS events retain source identity**: `ConnectionEvent::SmsMessages` carries `(DeviceId, SmsMessages)`; the plugin dispatcher attaches the authenticated source device before forwarding the event.
-
-#### kdeconnect-service
-
-✅ **Per-device SMS cache**: Replaced the single optional in-memory SMS payload with a map keyed by device ID. Incoming messages update memory and disk using their source ID. D-Bus and Varlink cache reads return only the requested device's data.
-
-✅ **Device-scoped D-Bus signals**: SMS message and attachment signals include `device_id`; the D-Bus client exposes it in `ServiceEvent`.
-
-#### Verification
-
-✅ **Service tests**: `cargo test -p kdeconnect-service --locked --offline`: 2 passed, 1 compositor-dependent clipboard test ignored. The new test confirms two phones retain distinct SMS cache values.
-
-✅ **Applet tests**: `cargo test -p cosmic-ext-connect-applet --locked --offline`: 3 passed. The new test confirms a 150-message thread initially renders messages 50 through 149.
-
-⏳ **Live multi-phone validation**: Install/restart the updated service and verify two paired phones cannot populate each other's SMS window or cache. No service was installed or restarted during this implementation.
-
-## Incoming Image Transfer - 2026-09-20
-
-The reported missing image was not reproduced; its historical failure cause remains unknown. The running service's stdout/stderr pointed to `/dev/null`. Items below extend the second review's transfer findings and remain pending.
-
-### kdeconnect-service
-
-⏳ **FT-01: Preserve transfer diagnostics**: Update `kdeconnect-service/src/main.rs` and the applet service launch in `cosmic-ext-connect-applet/src/main.rs:602-614` to retain logs in a bounded/rotated file or journal during normal launches. Verify native and Flatpak logging separately.
-
-### kdeconnect-core
-
-⏳ **FT-02: Log transfer stages and rejection reasons**: In `plugin_interface.rs`, `plugins/share.rs`, and `transport.rs`, record a transfer ID, source device, filename, expected size, current endpoint, destination, received bytes, stage, and full error chain. Report request receipt, invalid bodies, missing file metadata, and pairing/plugin rejection reasons. Do not log packet bodies, file contents, or credentials. Keep text/URL sharing independent of file metadata.
-
-⏳ **FT-04: Add deadlines and size validation**: In `transport.rs`, add connection, TLS-handshake, and read-inactivity deadlines with stage-specific errors. Allow large transfers that keep progressing. Reject short or excess payloads against the announced size.
-
-⏳ **FT-05: Save files safely and report destination failures** (partially implemented: filename checks, temporary files, atomic publication, collision/symlink protection, and cleanup are complete; size validation and Downloads error reporting remain): Reject unsafe filenames and symlink/collision races. Receive into a uniquely created temporary file in the destination directory, publish only after validation, and clean up failed partial files. Report unavailable/unwritable Downloads instead of silently falling back to `/tmp`. Apply equivalent path protections to MMS attachments.
-
-⏳ **FT-06: Refresh the phone's payload address**: Update `device.rs` and connection registration to retain the current connection address while preserving trusted pairing data. Verify file and MMS downloads after DHCP/network changes. Coordinate with the second review's certificate-authentication fix.
-
-### cosmic-ext-connect-applet
-
-⏳ **FT-03: Show incoming transfer status and errors**: Add structured events in `kdeconnect-core/src/event.rs`, propagate them through D-Bus/Varlink and clients, and display receiving/completed/failed states with throttled progress. Include transfer/device IDs, direction, filename, byte counts, and failure stage/reason. Keep a bounded recent-results list and show the saved path. Log notification failures separately; a saved file remains successful even if its notification fails.
-
-### Verification
-
-⏳ **FT-07: Test failures and a real phone transfer**: Cover malformed/missing metadata, connection refusal, TLS failure, stalled reception, unavailable destination, unsafe names, simultaneous duplicate names, short/excess payloads, and notification failure. Confirm one terminal result and matching diagnostic per detected transfer. Share a known image from the phone and verify contents, size, destination, UI status, and logs; record the installed build and timestamps.
+✅ **[P2] FT-07: Test failures and a real phone transfer** (automated coverage): New tests cover stalled reception (read-inactivity deadline), slow-but-progressing transfers, progress/EOF byte accounting, short/excess/valid/unannounced payload sizes, malformed/unsafe filenames, simultaneous duplicate names, temporary-file cleanup, transfer reporter throttling with exactly one terminal result, `TransferStatus` JSON roundtrip (the D-Bus/varlink contract), and the bounded deduped recent-results list. Notification failure is handled as log-only while the saved file stays a successful transfer. The real-phone portion — sharing a known image and verifying contents, destination, UI status, and logs against an installed build — remains pending under Live-device validation.

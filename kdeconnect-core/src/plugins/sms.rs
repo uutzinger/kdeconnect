@@ -105,20 +105,74 @@ impl SmsAttachmentFile {
         &self,
         device: &crate::device::Device,
         info: &crate::protocol::PacketPayloadTransferInfo,
+        expected_size: Option<u64>,
+        transfer: Option<crate::filetransfer::IncomingTransfer>,
     ) -> anyhow::Result<std::path::PathBuf> {
-        device.device_id.validate()?;
-        crate::download::validate_filename(&self.filename)?;
+        match self.receive_inner(device, info, expected_size, &transfer).await {
+            Ok((path, bytes)) => {
+                if let Some(t) = transfer {
+                    t.completed(path.clone(), bytes);
+                }
+                Ok(path)
+            }
+            Err((stage, e)) => {
+                if let Some(t) = transfer {
+                    t.failed(stage, format!("{:#}", e));
+                }
+                Err(e)
+            }
+        }
+    }
+
+    async fn receive_inner(
+        &self,
+        device: &crate::device::Device,
+        info: &crate::protocol::PacketPayloadTransferInfo,
+        expected_size: Option<u64>,
+        transfer: &Option<crate::filetransfer::IncomingTransfer>,
+    ) -> Result<(std::path::PathBuf, u64), (&'static str, anyhow::Error)> {
+        device
+            .device_id
+            .validate()
+            .map_err(|e| ("metadata", e.context("invalid device ID")))?;
+        crate::download::validate_filename(&self.filename)
+            .map_err(|e| ("metadata", e.context("unsafe attachment filename")))?;
         let cache_dir = attachments_dir(&device.device_id.0);
-        tokio::fs::create_dir_all(&cache_dir).await?;
-        let download = crate::download::Download::new(&cache_dir, &self.filename)?;
-        let mut file = download.writer()?;
+        tokio::fs::create_dir_all(&cache_dir)
+            .await
+            .map_err(|e| ("destination", anyhow::Error::new(e).context("creating cache dir")))?;
+        let download = crate::download::Download::new(&cache_dir, &self.filename)
+            .map_err(|e| ("destination", e.context("preparing destination file")))?;
+        let mut file = download
+            .writer()
+            .map_err(|e| ("destination", e.context("opening destination file")))?;
 
         let mut remote_addr = device.address;
         remote_addr.set_port(info.port);
 
-        crate::transport::receive_payload(device, &remote_addr, &mut file).await?;
+        let progress_fn;
+        let progress_cb: Option<&(dyn Fn(u64) + Send + Sync)> = match transfer {
+            Some(t) => {
+                progress_fn = move |bytes: u64| t.progress(bytes);
+                Some(&progress_fn)
+            }
+            None => None,
+        };
+
+        let received = crate::transport::receive_payload(
+            device,
+            &remote_addr,
+            &mut file,
+            expected_size,
+            progress_cb,
+        )
+        .await
+        .map_err(|e| (e.stage, anyhow::Error::new(e)))?;
         drop(file);
-        download.finish(false)
+        let dest = download
+            .finish(false)
+            .map_err(|e| ("publish", e.context("publishing attachment to cache")))?;
+        Ok((dest, received))
     }
 }
 

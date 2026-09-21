@@ -27,6 +27,9 @@ pub enum Message {
     ShareText(String),
     ShareUrl(String),
     UpdateTransferProgress(u8),
+    /// Structured status of one payload transfer (progress or terminal
+    /// result), from the service's `transfer_status` signal.
+    TransferStatusReceived(kdeconnect_core::event::TransferStatus),
 
     ClipboardSendFinished {
         device_id: String,

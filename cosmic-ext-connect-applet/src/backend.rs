@@ -7,7 +7,7 @@ use kdeconnect_dbus_client::{KdeConnectClient, ServiceEvent};
 use std::sync::Arc;
 use std::{any::TypeId, collections::HashMap};
 use tokio::sync::Mutex;
-use tracing::{error, info, warn};
+use tracing::{debug, error, info, warn};
 
 use crate::models::{Device, NowPlaying};
 
@@ -670,9 +670,60 @@ pub fn filetransfer_subscription() -> Subscription<crate::messages::Message> {
     Subscription::run_with(TypeId::of::<Worker>(), |_| {
         async_stream::stream! {
             let Ok(client) = KdeConnectClient::new().await else { return; };
+
+            // Seed the UI from the service's bounded recent-results list so
+            // transfers that finished before this subscription started are
+            // still visible.
+            if let Ok(devices) = client.list_devices().await {
+                for device in devices {
+                    match client.get_recent_transfers(&device.id).await {
+                        Ok(json) => {
+                            let statuses: Vec<kdeconnect_core::event::TransferStatus> =
+                                serde_json::from_str(&json).unwrap_or_default();
+                            for status in statuses {
+                                yield crate::messages::Message::TransferStatusReceived(status);
+                            }
+                        }
+                        Err(e) => {
+                            debug!("get_recent_transfers failed for {}: {:?}", device.id, e);
+                        }
+                    }
+                }
+            }
+
             let mut progress_stream = client.transfer_progress_stream().await;
-            while let Some(progress) = progress_stream.next().await {
-                yield crate::messages::Message::UpdateTransferProgress(progress);
+            let mut events = match client.listen_for_events().await {
+                Ok(s) => s,
+                Err(e) => {
+                    warn!("failed to subscribe to service events for transfer status: {:?}", e);
+                    return;
+                }
+            };
+
+            loop {
+                tokio::select! {
+                    progress = progress_stream.next() => {
+                        match progress {
+                            Some(p) => yield crate::messages::Message::UpdateTransferProgress(p),
+                            None => break,
+                        }
+                    }
+                    event = events.next() => {
+                        match event {
+                            Some(ServiceEvent::TransferStatusReceived(_, json)) => {
+                                match serde_json::from_str(&json) {
+                                    Ok(status) => {
+                                        yield crate::messages::Message::TransferStatusReceived(status)
+                                    }
+                                    Err(e) => warn!("bad transfer status payload: {:?}", e),
+                                }
+                            }
+                            // Every other event kind has its own subscription.
+                            Some(_) => {}
+                            None => break,
+                        }
+                    }
+                }
             }
         }
     })

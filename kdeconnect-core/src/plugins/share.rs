@@ -62,10 +62,21 @@ impl ShareRequest {
     pub async fn receive_share(
         &self,
         device: &Device,
-        info: &PacketPayloadTransferInfo,
+        info: Option<&PacketPayloadTransferInfo>,
+        expected_size: Option<u64>,
+        transfer: Option<crate::filetransfer::IncomingTransfer>,
     ) -> anyhow::Result<()> {
         match self {
-            ShareRequest::File(f) => self.handle_file_request(f, device, info).await,
+            ShareRequest::File(f) => {
+                let info = info.ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "[share] file share '{}' missing payload transfer info",
+                        f.filename
+                    )
+                })?;
+                self.handle_file_request(f, device, info, expected_size, transfer)
+                    .await
+            }
             ShareRequest::Text { text } => {
                 let text = text.clone();
                 tokio::task::spawn_blocking(move || {
@@ -106,52 +117,106 @@ impl ShareRequest {
         request: &ShareRequestFile,
         device: &Device,
         info: &PacketPayloadTransferInfo,
+        expected_size: Option<u64>,
+        transfer: Option<crate::filetransfer::IncomingTransfer>,
     ) -> anyhow::Result<()> {
-        let download_dir = dirs::download_dir().unwrap_or_else(|| {
-            warn!("[share] cannot find Downloads dir, falling back to /tmp");
-            PathBuf::from("/tmp")
-        });
+        match self
+            .receive_file_inner(request, device, info, expected_size, &transfer)
+            .await
+        {
+            Ok((dest, bytes)) => {
+                info!(
+                    "[share] saved '{}' to {:?} ({} bytes)",
+                    request.filename, dest, bytes
+                );
+                if let Some(t) = transfer {
+                    t.completed(dest.clone(), bytes);
+                }
 
-        let download = crate::download::Download::new(&download_dir, &request.filename)?;
-        let mut file = download.writer()?;
+                let dest_display = dest.display().to_string();
+                let filename = request.filename.clone();
+                let notified = tokio::task::spawn_blocking(move || {
+                    notify_rust::Notification::new()
+                        .appname("KDE Connect")
+                        .summary(&format!("File received: {}", filename))
+                        .body(&dest_display)
+                        .show()
+                        .map(|_| ())
+                })
+                .await;
+                // A saved file stays a successful transfer even when its
+                // notification fails — log the notification failure only.
+                match notified {
+                    Ok(Ok(())) => {}
+                    Ok(Err(e)) => warn!("[share] notification failed for saved file: {}", e),
+                    Err(e) => warn!("[share] notification task failed for saved file: {}", e),
+                }
+
+                Ok(())
+            }
+            Err((stage, e)) => {
+                if let Some(t) = transfer {
+                    t.failed(stage, format!("{:#}", e));
+                }
+                Err(e)
+            }
+        }
+    }
+
+    /// Receives the payload into a temporary file in the destination
+    /// directory and publishes it only after the transfer validates. Each
+    /// fallible step is tagged with its failure stage for UI reporting.
+    async fn receive_file_inner(
+        &self,
+        request: &ShareRequestFile,
+        device: &Device,
+        info: &PacketPayloadTransferInfo,
+        expected_size: Option<u64>,
+        transfer: &Option<crate::filetransfer::IncomingTransfer>,
+    ) -> Result<(PathBuf, u64), (&'static str, anyhow::Error)> {
+        // An unavailable/unwritable Downloads directory is reported, not
+        // silently replaced with /tmp.
+        let download_dir = dirs::download_dir()
+            .ok_or_else(|| ("destination", anyhow::anyhow!("Downloads directory is unavailable")))?;
+
+        let download = crate::download::Download::new(&download_dir, &request.filename)
+            .map_err(|e| ("destination", e.context("preparing destination file")))?;
+        let mut file = download
+            .writer()
+            .map_err(|e| ("destination", e.context("opening destination file")))?;
 
         let mut remote_addr = device.address;
         remote_addr.set_port(info.port);
 
+        let progress_fn;
+        let progress_cb: Option<&(dyn Fn(u64) + Send + Sync)> = match transfer {
+            Some(t) => {
+                progress_fn = move |bytes: u64| t.progress(bytes);
+                Some(&progress_fn)
+            }
+            None => None,
+        };
+
         info!(
-            "[share] receiving '{}' from {} ({}:{})",
+            "[share] receiving '{}' from {} ({}:{}), expecting {:?} bytes",
             request.filename,
             device.name,
             remote_addr.ip(),
-            info.port
+            info.port,
+            expected_size
         );
 
-        if let Err(e) = receive_payload(device, &remote_addr, &mut file).await {
-            warn!(
-                "[share] receive_payload failed for '{}': {}",
-                request.filename, e
-            );
-            return Err(e);
-        }
+        let received =
+            receive_payload(device, &remote_addr, &mut file, expected_size, progress_cb)
+                .await
+                .map_err(|e| (e.stage, anyhow::Error::new(e)))?;
 
         drop(file);
-        let dest = download.finish(true)?;
+        let dest = download
+            .finish(true)
+            .map_err(|e| ("publish", e.context("publishing file to Downloads")))?;
 
-        info!("[share] saved '{}' to {:?}", request.filename, dest);
-
-        let dest_display = dest.display().to_string();
-        let filename = request.filename.clone();
-        tokio::task::spawn_blocking(move || {
-            let _ = notify_rust::Notification::new()
-                .appname("KDE Connect")
-                .summary(&format!("File received: {}", filename))
-                .body(&dest_display)
-                .show();
-        })
-        .await
-        .ok();
-
-        Ok(())
+        Ok((dest, received))
     }
 }
 

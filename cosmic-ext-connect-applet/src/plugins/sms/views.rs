@@ -232,8 +232,7 @@ fn view_conversation_item<'a>(
 ) -> Element<'a, SmsMessage> {
     let is_selected = app.selected_thread.as_ref() == Some(&conv.thread_id);
 
-    let display_name =
-        get_contact_name(app, &conv.phone_number).unwrap_or_else(|| conv.phone_number.clone());
+    let display_name = conv.display_name();
     let unread = is_conversation_unread(app, conv);
 
     let mut name_row = widget::Row::new()
@@ -345,8 +344,7 @@ fn view_thread_header<'a>(
     conv: &'a Conversation,
     spacing: &cosmic::cosmic_theme::Spacing,
 ) -> Element<'a, SmsMessage> {
-    let display_name =
-        get_contact_name(app, &conv.phone_number).unwrap_or_else(|| conv.phone_number.clone());
+    let display_name = conv.display_name();
     let photo = get_contact_photo(app, &conv.phone_number);
 
     widget::container(

@@ -44,6 +44,9 @@ pub enum ServiceEvent {
     SmsAttachmentReceived(String, String, String), // device_id, filename, path
     /// Phone -> base64-encoded photo
     ContactPhotosReceived(HashMap<String, String>),
+    /// Structured transfer status (device_id, status_json) — a serialized
+    /// `kdeconnect_core::event::TransferStatus`.
+    TransferStatusReceived(String, String),
 }
 
 /// D-Bus proxy for daemon interface
@@ -83,6 +86,11 @@ trait Daemon {
 
     #[zbus(signal)]
     async fn update_transfer_progress(&self, progress: u8) -> zbus::Result<()>;
+
+    #[zbus(signal)]
+    async fn transfer_status(&self, device_id: String, status_json: String) -> zbus::Result<()>;
+
+    async fn get_recent_transfers(&self, device_id: &str) -> zbus::Result<String>;
 
     #[zbus(signal)]
     async fn device_connected(&self, device_id: String, device: Device) -> zbus::Result<()>;
@@ -375,6 +383,12 @@ impl KdeConnectClient {
         Ok(self.contacts_proxy.get_cached_contact_photos(device_id).await?)
     }
 
+    /// Recent transfer statuses for a device as a raw JSON string (array of
+    /// serialized `TransferStatus`, newest first).
+    pub async fn get_recent_transfers(&self, device_id: &str) -> Result<String> {
+        Ok(self.daemon_proxy.get_recent_transfers(device_id).await?)
+    }
+
     /// Create a stream of service events
     pub async fn listen_for_events(
         &self,
@@ -617,6 +631,23 @@ impl KdeConnectClient {
                 }
             });
 
+        let transfer_status = self
+            .daemon_proxy
+            .receive_transfer_status()
+            .await?
+            .filter_map(|s| async move {
+                match s.args() {
+                    Ok(args) => Some(ServiceEvent::TransferStatusReceived(
+                        args.device_id.clone(),
+                        args.status_json.clone(),
+                    )),
+                    Err(e) => {
+                        error!("Failed to parse TransferStatus signal: {:?}", e);
+                        None
+                    }
+                }
+            });
+
         Ok(Box::pin(select_all(vec![
             Box::pin(connected) as futures::stream::BoxStream<'static, ServiceEvent>,
             Box::pin(paired),
@@ -632,6 +663,7 @@ impl KdeConnectClient {
             Box::pin(mount_state),
             Box::pin(attachment),
             Box::pin(contact_photos),
+            Box::pin(transfer_status),
         ])))
     }
 

@@ -12,7 +12,7 @@ use crate::{
     GLOBAL_CONFIG,
     device::Device,
     event::{ConnectionEvent, CoreEvent},
-    filetransfer::{send_progress, TransferAdapter},
+    filetransfer::{IncomingTransfer, send_progress, TransferAdapter},
     plugins::{
         self,
         battery::Battery,
@@ -129,6 +129,7 @@ impl PluginRegistry {
         let connection_tx = tx;
         let mpris_connection_tx = mpris_tx;
         let payload_info = packet.payload_transfer_info;
+        let payload_size = packet.payload_size;
 
         match packet.packet_type {
             PacketType::Identity => {
@@ -151,19 +152,41 @@ impl PluginRegistry {
                     && let Some(payload_info) = payload_info
                 {
                     let connection_tx = connection_tx.clone();
+                    let transfer = IncomingTransfer::new(
+                        connection_tx.clone(),
+                        &device.device_id,
+                        Some(attachment_file.filename.clone()),
+                        payload_size,
+                    );
+                    info!(
+                        "[sms] transfer {}: attachment '{}' from {} announced={:?}B",
+                        transfer.id(),
+                        attachment_file.filename,
+                        device.name,
+                        payload_size
+                    );
+                    transfer.started();
                     // Spawn so the event loop is not blocked while the
                     // payload (a photo or video) downloads.
                     tokio::spawn(async move {
                         let filename = attachment_file.filename.clone();
-                        match attachment_file.receive(&device, &payload_info).await {
+                        match attachment_file
+                            .receive(&device, &payload_info, payload_size, Some(transfer))
+                            .await
+                        {
                             Ok(path) => {
                                 let _ = connection_tx.send(ConnectionEvent::SmsAttachmentReceived(
                                     (device.device_id.clone(), filename, path),
                                 ));
                             }
-                            Err(e) => warn!("[sms] attachment receive failed: {}", e),
+                            Err(e) => warn!("[sms] attachment receive failed: {:#}", e),
                         }
                     });
+                } else {
+                    warn!(
+                        "[sms] attachment_file from {} rejected: invalid body or missing payload transfer info",
+                        device.name
+                    );
                 }
             }
             PacketType::SmsMessages => {
@@ -296,12 +319,21 @@ impl PluginRegistry {
                         let player = player.clone();
                         let album_art_url = album_art_url.clone();
                         let art_tx = mpris_connection_tx.clone();
+                        let transfer = IncomingTransfer::new(
+                            mpris_connection_tx.clone(),
+                            &device.device_id,
+                            Some(format!("{player} album art")),
+                            payload_size,
+                        );
+                        transfer.started();
                         tokio::spawn(async move {
                             match plugins::mpris::download_album_art(
                                 &device,
                                 &player,
                                 &album_art_url,
                                 &info,
+                                payload_size,
+                                Some(transfer),
                             )
                             .await
                             {
@@ -316,7 +348,7 @@ impl PluginRegistry {
                                         ready,
                                     )));
                                 }
-                                Err(e) => warn!("[mpris] album art download failed: {}", e),
+                                Err(e) => warn!("[mpris] album art download failed: {:#}", e),
                             }
                         });
                     }
@@ -363,15 +395,44 @@ impl PluginRegistry {
             PacketType::ShareRequest => {
                 if let Ok(share_request) =
                     serde_json::from_value::<plugins::share::ShareRequest>(body)
-                    && let Some(payload_info) = payload_info
                 {
+                    // File shares get a tracked transfer; text/URL shares are
+                    // body-only and stay independent of file metadata.
+                    let transfer = match &share_request {
+                        plugins::share::ShareRequest::File(f) => {
+                            let t = IncomingTransfer::new(
+                                connection_tx.clone(),
+                                &device.device_id,
+                                Some(f.filename.clone()),
+                                payload_size,
+                            );
+                            info!(
+                                "[share] transfer {}: request from {} file='{}' announced={:?}B",
+                                t.id(),
+                                device.name,
+                                f.filename,
+                                payload_size
+                            );
+                            t.started();
+                            Some(t)
+                        }
+                        _ => None,
+                    };
                     // Spawn so the event loop is not blocked during the
                     // notification dialog wait + network payload download.
                     tokio::spawn(async move {
-                        if let Err(e) = share_request.receive_share(&device, &payload_info).await {
-                            warn!("[share] receive_share failed: {}", e);
+                        if let Err(e) = share_request
+                            .receive_share(&device, payload_info.as_ref(), payload_size, transfer)
+                            .await
+                        {
+                            warn!("[share] receive_share failed: {:#}", e);
                         }
                     });
+                } else {
+                    warn!(
+                        "[share] invalid share request body from {} — not a file/text/url share",
+                        device.name
+                    );
                 }
             }
             PacketType::SystemVolumeRequest => {

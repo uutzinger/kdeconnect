@@ -12,7 +12,7 @@ use kdeconnect_varlink::iface::{
     Call_AcceptPairing, Call_RejectPairing, Call_Subscribe,
     Call_RequestConversations, Call_RequestConversation, Call_SendSms,
     Call_GetCachedSms, Call_RequestContacts, Call_GetCachedContacts, Call_RequestSmsAttachment,
-    Call_GetCachedContactPhotos,
+    Call_GetCachedContactPhotos, Call_GetRecentTransfers,
 };
 use kdeconnect_varlink::socket_address;
 use kdeconnect_core::{PacketType, ProtocolPacket, device::DeviceId, event::AppEvent};
@@ -47,6 +47,7 @@ pub struct KdeConnectVarlinkService {
     sms_cache: crate::dbus_interface::SmsCache,
     clipboard: Option<ClipboardHandle>,
     broadcast_tx: broadcast::Sender<VarlinkEvent>,
+    recent_transfers: crate::dbus_interface::RecentTransfers,
 }
 
 impl KdeConnectVarlinkService {
@@ -56,8 +57,9 @@ impl KdeConnectVarlinkService {
         sms_cache: crate::dbus_interface::SmsCache,
         clipboard: Option<ClipboardHandle>,
         broadcast_tx: broadcast::Sender<VarlinkEvent>,
+        recent_transfers: crate::dbus_interface::RecentTransfers,
     ) -> Self {
-        Self { event_sender, devices, sms_cache, clipboard, broadcast_tx }
+        Self { event_sender, devices, sms_cache, clipboard, broadcast_tx, recent_transfers }
     }
 }
 
@@ -275,6 +277,12 @@ impl VarlinkInterface for KdeConnectVarlinkService {
         call.reply(crate::dbus_interface::load_sms_cache(&device_id).await.unwrap_or_default())
     }
 
+    async fn get_recent_transfers(&self, call: &mut dyn Call_GetRecentTransfers, device_id: String) -> varlink::Result<()> {
+        let list = self.recent_transfers.lock().await;
+        let statuses: Vec<_> = list.iter().filter(|s| s.device_id == device_id).collect();
+        call.reply(serde_json::to_string(&statuses).unwrap_or_else(|_| "[]".to_string()))
+    }
+
     async fn request_contacts(&self, call: &mut dyn Call_RequestContacts, device_id: String) -> varlink::Result<()> {
         let packet = ProtocolPacket::new(PacketType::ContactsRequestAllUidsTimestamps, json!({}));
         let _ = self.event_sender.send(AppEvent::SendPacket(DeviceId(device_id), packet));
@@ -352,6 +360,7 @@ pub async fn run_varlink_server(
     sms_cache: crate::dbus_interface::SmsCache,
     clipboard: Option<ClipboardHandle>,
     broadcast_tx: broadcast::Sender<VarlinkEvent>,
+    recent_transfers: crate::dbus_interface::RecentTransfers,
 ) -> Result<()> {
     let service = Arc::new(KdeConnectVarlinkService::new(
         event_sender,
@@ -359,6 +368,7 @@ pub async fn run_varlink_server(
         sms_cache,
         clipboard,
         broadcast_tx,
+        recent_transfers,
     ));
     let handler = Arc::new(iface::new(service));
 

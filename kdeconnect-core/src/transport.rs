@@ -10,7 +10,7 @@ use std::{
 use rustls::pki_types::ServerName;
 use socket2::TcpKeepalive;
 use tokio::{
-    io::{AsyncBufReadExt as _, AsyncReadExt as _, AsyncWriteExt, BufReader, split},
+    io::{AsyncBufReadExt as _, AsyncRead, AsyncReadExt as _, AsyncWrite, AsyncWriteExt, BufReader, split},
     net::{TcpListener, TcpStream, UdpSocket},
     sync::{Mutex, Semaphore, mpsc, oneshot},
     time::MissedTickBehavior,
@@ -602,33 +602,168 @@ pub(crate) async fn prepare_listener_for_payload() -> Result<TcpListener, String
     Err("no free port for payload, failed.".to_string())
 }
 
+/// Stage-specific payload receive failure: `stage` names where it happened
+/// so callers can report a machine-readable failure stage to the UI without
+/// parsing error strings. The full chain is preserved via `source`.
+pub(crate) struct PayloadError {
+    pub stage: &'static str,
+    pub source: anyhow::Error,
+}
+
+impl std::fmt::Display for PayloadError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}: {:#}", self.stage, self.source)
+    }
+}
+
+impl std::fmt::Debug for PayloadError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "PayloadError {{ stage: {:?}, source: {:?} }}", self.stage, self.source)
+    }
+}
+
+impl std::error::Error for PayloadError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(self.source.root_cause())
+    }
+}
+
+/// Deadlines for inbound payload transfers. The inactivity deadline only
+/// fires when no bytes arrive for its whole duration, so large transfers
+/// that keep progressing are never cut off.
+const PAYLOAD_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+const PAYLOAD_INACTIVITY_TIMEOUT: Duration = Duration::from_secs(30);
+
 pub(crate) async fn receive_payload(
     device: &Device,
     addr: &SocketAddr,
     save_path: &mut tokio::fs::File,
-) -> anyhow::Result<()> {
+    expected_size: Option<u64>,
+    on_progress: Option<&(dyn Fn(u64) + Send + Sync)>,
+) -> Result<u64, PayloadError> {
     let config = GLOBAL_CONFIG.get().unwrap();
     let client_config = config.key_store.client_config.clone();
     debug!("client config created.");
 
-    let stream = TcpStream::connect(&addr).await?;
+    let stream = tokio::time::timeout(PAYLOAD_CONNECT_TIMEOUT, TcpStream::connect(addr))
+        .await
+        .map_err(|_| PayloadError {
+            stage: "connect",
+            source: anyhow::anyhow!(
+                "connection to {} timed out after {:?}",
+                addr,
+                PAYLOAD_CONNECT_TIMEOUT
+            ),
+        })?
+        .map_err(|e| PayloadError {
+            stage: "connect",
+            source: anyhow::Error::new(e).context(format!("connecting to {}", addr)),
+        })?;
 
-    let domain = ServerName::try_from(device.device_id.0.as_str())?.to_owned();
+    let domain = ServerName::try_from(device.device_id.0.as_str())
+        .map_err(|e| PayloadError {
+            stage: "connect",
+            source: anyhow::Error::new(e).context("invalid TLS server name"),
+        })?
+        .to_owned();
 
-    let mut stream = tokio_rustls::TlsConnector::from(client_config)
-        .connect(domain, stream)
-        .await?;
+    let mut stream = tokio::time::timeout(
+        HANDSHAKE_TIMEOUT,
+        tokio_rustls::TlsConnector::from(client_config).connect(domain, stream),
+    )
+    .await
+    .map_err(|_| PayloadError {
+        stage: "tls-handshake",
+        source: anyhow::anyhow!("timed out after {:?}", HANDSHAKE_TIMEOUT),
+    })?
+    .map_err(|e| PayloadError {
+        stage: "tls-handshake",
+        source: anyhow::Error::new(e).context("TLS handshake failed"),
+    })?;
 
     debug!("connected");
 
-    verify_payload_peer(device, stream.get_ref().1.peer_certificates())?;
-    tokio::io::copy(&mut stream, save_path).await?;
-    save_path.flush().await?;
-    stream.flush().await?;
-    stream.shutdown().await?;
+    verify_payload_peer(device, stream.get_ref().1.peer_certificates()).map_err(|e| {
+        PayloadError {
+            stage: "verify-peer",
+            source: e,
+        }
+    })?;
 
-    info!("successfully received payload");
+    let received =
+        copy_with_inactivity_deadline(&mut stream, save_path, PAYLOAD_INACTIVITY_TIMEOUT, on_progress)
+            .await
+            .map_err(|e| PayloadError {
+                stage: "receive",
+                source: e,
+            })?;
 
+    validate_payload_size(expected_size, received).map_err(|e| PayloadError {
+        stage: "size-validation",
+        source: e,
+    })?;
+
+    save_path.flush().await.map_err(|e| PayloadError {
+        stage: "finalize",
+        source: anyhow::Error::new(e).context("flushing received file"),
+    })?;
+    stream.flush().await.map_err(|e| PayloadError {
+        stage: "finalize",
+        source: anyhow::Error::new(e).context("flushing TLS stream"),
+    })?;
+    stream.shutdown().await.map_err(|e| PayloadError {
+        stage: "finalize",
+        source: anyhow::Error::new(e).context("closing TLS stream"),
+    })?;
+
+    info!("successfully received payload ({} bytes)", received);
+
+    Ok(received)
+}
+
+/// Copy `reader` → `writer`, failing if no bytes arrive for `deadline`.
+/// Reports cumulative received bytes via `on_progress` after each read.
+async fn copy_with_inactivity_deadline(
+    reader: &mut (impl AsyncRead + Unpin),
+    writer: &mut (impl AsyncWrite + Unpin),
+    deadline: Duration,
+    on_progress: Option<&(dyn Fn(u64) + Send + Sync)>,
+) -> anyhow::Result<u64> {
+    let mut total = 0u64;
+    let mut buf = vec![0u8; 64 * 1024];
+    loop {
+        let n = match tokio::time::timeout(deadline, reader.read(&mut buf)).await {
+            Ok(res) => res?,
+            Err(_) => {
+                anyhow::bail!(
+                    "transfer stalled: no bytes received for {:?} ({} bytes so far)",
+                    deadline,
+                    total
+                )
+            }
+        };
+        if n == 0 {
+            return Ok(total);
+        }
+        writer.write_all(&buf[..n]).await?;
+        total += n as u64;
+        if let Some(cb) = on_progress {
+            cb(total);
+        }
+    }
+}
+
+/// A clean EOF before (or after) the announced size means the transfer was
+/// truncated or padded; callers must not publish the file in that case.
+fn validate_payload_size(expected_size: Option<u64>, received: u64) -> anyhow::Result<()> {
+    if let Some(expected) = expected_size {
+        anyhow::ensure!(
+            received == expected,
+            "payload size mismatch: announced {} bytes, received {}",
+            expected,
+            received
+        );
+    }
     Ok(())
 }
 
@@ -718,6 +853,96 @@ mod tests {
             incoming_capabilities: vec![],
             outgoing_capabilities: vec![],
         }
+    }
+
+    #[test]
+    fn payload_size_is_validated() {
+        // No announced size: nothing to validate against.
+        assert!(validate_payload_size(None, 0).is_ok());
+        assert!(validate_payload_size(None, 123).is_ok());
+        assert!(validate_payload_size(Some(10), 10).is_ok());
+        // Clean EOF before the announced size (truncated transfer).
+        assert!(validate_payload_size(Some(10), 9).is_err());
+        // More bytes than announced.
+        assert!(validate_payload_size(Some(10), 11).is_err());
+    }
+
+    #[tokio::test]
+    async fn copy_loop_reports_progress_and_eof() {
+        let (mut sender, mut receiver) = tokio::io::duplex(4096);
+        let progress = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let progress_clone = progress.clone();
+        let cb = move |bytes: u64| progress_clone.lock().unwrap().push(bytes);
+
+        let writer = tokio::spawn(async move {
+            sender.write_all(b"chunk-one-").await.unwrap();
+            sender.write_all(b"chunk-two").await.unwrap();
+            // Dropping the sender yields a clean EOF for the reader.
+        });
+
+        let mut sink = tokio::io::sink();
+        let received = copy_with_inactivity_deadline(
+            &mut receiver,
+            &mut sink,
+            Duration::from_secs(5),
+            Some(&cb),
+        )
+        .await
+        .unwrap();
+
+        writer.await.unwrap();
+        assert_eq!(received, 19);
+        let calls = progress.lock().unwrap();
+        // Reads may coalesce, so only monotonicity and the final cumulative
+        // count are guaranteed.
+        assert!(!calls.is_empty());
+        assert!(calls.windows(2).all(|w| w[0] < w[1]));
+        assert_eq!(*calls.last().unwrap(), 19);
+    }
+
+    #[tokio::test]
+    async fn copy_loop_fails_when_transfer_stalls() {
+        let (sender, mut receiver) = tokio::io::duplex(4096);
+        // Keep the writer open but silent: the read must hit the inactivity
+        // deadline instead of hanging forever.
+        let _sender = sender;
+
+        let mut sink = tokio::io::sink();
+        let err = copy_with_inactivity_deadline(
+            &mut receiver,
+            &mut sink,
+            Duration::from_millis(50),
+            None,
+        )
+        .await
+        .unwrap_err();
+
+        assert!(err.to_string().contains("stalled"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn copy_loop_allows_slow_but_progressing_transfer() {
+        let (mut sender, mut receiver) = tokio::io::duplex(4096);
+        let writer = tokio::spawn(async move {
+            for _ in 0..5 {
+                sender.write_all(b"x").await.unwrap();
+                // Each chunk arrives well inside the inactivity deadline.
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        });
+
+        let mut sink = tokio::io::sink();
+        let received = copy_with_inactivity_deadline(
+            &mut receiver,
+            &mut sink,
+            Duration::from_millis(200),
+            None,
+        )
+        .await
+        .unwrap();
+
+        writer.await.unwrap();
+        assert_eq!(received, 5);
     }
 
     #[tokio::test]

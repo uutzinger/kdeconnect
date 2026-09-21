@@ -38,6 +38,36 @@ pub fn normalize_phone_number(phone: &str) -> String {
     phone.chars().filter(|c| c.is_ascii_digit()).collect()
 }
 
+/// Minimum digits a normalized address needs before we trust a contact
+/// lookup with it. Shorter strings — empty results from alphanumeric RCS
+/// group tokens, PBX extensions — collide with unrelated short contacts
+/// (e.g. a "Skype call" contact whose number is just "+").
+pub const MIN_LOOKUP_DIGITS: usize = 7;
+
+/// Builds a conversation's display name from all of its participant
+/// addresses: each address resolves to its contact name when the lookup
+/// succeeds, and falls back to the raw address otherwise. Returns an
+/// empty string when the thread has no addresses, letting callers fall
+/// back to the conversation's primary number.
+pub fn resolve_conversation_name(
+    addresses: &[String],
+    contacts_by_phone: &std::collections::HashMap<String, String>,
+) -> String {
+    addresses
+        .iter()
+        .map(|address| {
+            let digits = normalize_phone_number(address);
+            if digits.len() >= MIN_LOOKUP_DIGITS
+                && let Some(name) = contacts_by_phone.get(&digits)
+            {
+                return name.clone();
+            }
+            address.clone()
+        })
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
 /// Checks if two phone numbers match, handling various formats intelligently.
 ///
 /// Handles:
@@ -114,5 +144,49 @@ mod tests {
         assert!(phone_numbers_match("5551234567", "5551234567"));
         assert!(phone_numbers_match("5551234567", "15551234567"));
         assert!(phone_numbers_match("+1-555-123-4567", "5551234567"));
+    }
+
+    #[test]
+    fn group_name_joins_participants_and_guards_degenerate_lookups() {
+        use super::{MIN_LOOKUP_DIGITS, resolve_conversation_name};
+        use std::collections::HashMap;
+
+        let contacts: HashMap<String, String> = [
+            ("15551110001".to_string(), "Amy".to_string()),
+            ("15551110002".to_string(), "Clara".to_string()),
+            // Degenerate synced contact (TEL of "+") must never match.
+            ("".to_string(), "Skype call".to_string()),
+        ]
+        .into_iter()
+        .collect();
+
+        // Group thread: known participants resolve to names.
+        let addresses = vec![
+            "+1-555-111-0001".to_string(),
+            "+1-555-111-0002".to_string(),
+        ];
+        assert_eq!(resolve_conversation_name(&addresses, &contacts), "Amy, Clara");
+
+        // Unknown participant keeps its raw address.
+        let addresses = vec!["+1-555-111-0001".to_string(), "+1-555-999-9999".to_string()];
+        assert_eq!(
+            resolve_conversation_name(&addresses, &contacts),
+            "Amy, +1-555-999-9999"
+        );
+
+        // Alphanumeric RCS group token: no digits, no lookup — and no
+        // "Skype call" despite the degenerate contact entry.
+        let addresses = vec!["rcs-group-token".to_string()];
+        assert_eq!(
+            resolve_conversation_name(&addresses, &contacts),
+            "rcs-group-token"
+        );
+
+        // Short-code addresses are never resolved against short contacts.
+        assert!(MIN_LOOKUP_DIGITS > 4);
+        let addresses = vec!["2223".to_string()];
+        assert_eq!(resolve_conversation_name(&addresses, &contacts), "2223");
+
+        assert_eq!(resolve_conversation_name(&[], &contacts), "");
     }
 }

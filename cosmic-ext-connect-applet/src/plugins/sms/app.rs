@@ -26,6 +26,86 @@ pub(crate) fn message_window_start(total: usize, window_size: usize) -> usize {
     total.saturating_sub(window_size)
 }
 
+/// Max age difference between an optimistic outgoing message and its echo
+/// from the phone for them to count as the same message.
+const ECHO_MATCH_WINDOW_MS: i64 = 300_000;
+
+/// Position index over the message list for O(1) duplicate detection:
+/// protocol ID -> position, plus body -> positions of optimistic outgoing
+/// (`sending_*`) messages awaiting their phone echo. Positions go stale
+/// when the list is re-sorted, so `rebuild` must be called after every
+/// sort; `clear` alongside the list itself.
+#[derive(Default)]
+struct MessageIndex {
+    by_id: HashMap<String, usize>,
+    pending_outgoing: HashMap<String, Vec<usize>>,
+}
+
+impl MessageIndex {
+    fn rebuild(&mut self, messages: &[Message]) {
+        self.by_id.clear();
+        self.pending_outgoing.clear();
+        for (pos, m) in messages.iter().enumerate() {
+            self.by_id.insert(m.id.clone(), pos);
+            if m.id.starts_with("sending_") && m.is_sent() {
+                self.pending_outgoing
+                    .entry(m.body.clone())
+                    .or_default()
+                    .push(pos);
+            }
+        }
+    }
+
+    fn clear(&mut self) {
+        self.by_id.clear();
+        self.pending_outgoing.clear();
+    }
+
+    /// Append `message` to `messages`, or fold it into the optimistic
+    /// outgoing message it echoes. Returns true if it was appended.
+    fn insert_or_merge(&mut self, messages: &mut Vec<Message>, message: &Message) -> bool {
+        if self.by_id.contains_key(&message.id) {
+            return false;
+        }
+
+        // Phone echo of an optimistic send: adopt the real ID/date in place.
+        if message.is_sent()
+            && let Some(pos) = self
+                .pending_outgoing
+                .get(&message.body)
+                .and_then(|positions| {
+                    positions.iter().copied().find(|&pos| {
+                        (messages[pos].date - message.date).abs() < ECHO_MATCH_WINDOW_MS
+                    })
+                })
+        {
+            let old_id = std::mem::replace(&mut messages[pos].id, message.id.clone());
+            messages[pos].thread_id = message.thread_id.clone();
+            messages[pos].date = message.date;
+            self.by_id.remove(&old_id);
+            self.by_id.insert(message.id.clone(), pos);
+            if let Some(positions) = self.pending_outgoing.get_mut(&message.body) {
+                positions.retain(|&p| p != pos);
+                if positions.is_empty() {
+                    self.pending_outgoing.remove(&message.body);
+                }
+            }
+            return false;
+        }
+
+        let pos = messages.len();
+        self.by_id.insert(message.id.clone(), pos);
+        if message.id.starts_with("sending_") && message.is_sent() {
+            self.pending_outgoing
+                .entry(message.body.clone())
+                .or_default()
+                .push(pos);
+        }
+        messages.push(message.clone());
+        true
+    }
+}
+
 pub struct SmsWindow {
     core: Core,
     pub device_id: String,
@@ -45,6 +125,9 @@ pub struct SmsWindow {
     pub selected_thread: Option<String>,
     pub contact_idx: Option<usize>,
     pub messages: Vec<Message>,
+    /// Indexed lookup over `messages` for duplicate detection — see
+    /// `MessageIndex`. Must stay in sync with `messages`.
+    message_index: MessageIndex,
     /// How many of the most recent messages in `messages` are currently
     /// rendered. Increases when the user asks to load older messages.
     pub messages_window_size: usize,
@@ -76,7 +159,8 @@ pub struct SmsWindow {
 
 #[cfg(test)]
 mod tests {
-    use super::message_window_start;
+    use super::{ECHO_MATCH_WINDOW_MS, MessageIndex, message_window_start};
+    use crate::plugins::sms::models::Message;
 
     #[test]
     fn message_window_starts_at_newest_page() {
@@ -93,6 +177,98 @@ mod tests {
         assert_eq!(visible.first(), Some(&50));
         assert_eq!(visible.last(), Some(&149));
         assert_eq!(visible.len(), 100);
+    }
+
+    fn message(id: &str, body: &str, date: i64, type_: i32) -> Message {
+        Message {
+            id: id.to_string(),
+            thread_id: "1".to_string(),
+            body: body.to_string(),
+            address: "+15551234567".to_string(),
+            date,
+            attachments: Vec::new(),
+            type_,
+            read: true,
+        }
+    }
+
+    #[test]
+    fn duplicate_id_is_not_inserted_twice() {
+        let mut index = MessageIndex::default();
+        let mut messages = Vec::new();
+
+        assert!(index.insert_or_merge(&mut messages, &message("42", "hi", 1_000, 1)));
+        assert!(!index.insert_or_merge(&mut messages, &message("42", "hi", 1_000, 1)));
+        assert_eq!(messages.len(), 1);
+    }
+
+    #[test]
+    fn outgoing_echo_merges_into_optimistic_send() {
+        let mut index = MessageIndex::default();
+        let mut messages = Vec::new();
+
+        assert!(index.insert_or_merge(&mut messages, &message("sending_900", "hello", 900, 2)));
+        // The phone echoes the sent message back with its real ID.
+        assert!(!index.insert_or_merge(&mut messages, &message("77", "hello", 1_000, 2)));
+
+        assert_eq!(messages.len(), 1);
+        assert_eq!(messages[0].id, "77");
+        assert_eq!(messages[0].date, 1_000);
+
+        // A later replay of the real message is a plain duplicate, and a
+        // second echo must not match anything (the pending entry is gone).
+        assert!(!index.insert_or_merge(&mut messages, &message("77", "hello", 1_000, 2)));
+        assert!(index.insert_or_merge(&mut messages, &message("78", "hello", 2_000, 2)));
+        assert_eq!(messages.len(), 2);
+    }
+
+    #[test]
+    fn echo_outside_time_window_does_not_merge() {
+        let mut index = MessageIndex::default();
+        let mut messages = Vec::new();
+
+        assert!(index.insert_or_merge(&mut messages, &message("sending_1", "hello", 1_000, 2)));
+        assert!(index.insert_or_merge(
+            &mut messages,
+            &message("77", "hello", 1_000 + ECHO_MATCH_WINDOW_MS, 2)
+        ));
+        assert_eq!(messages.len(), 2);
+    }
+
+    #[test]
+    fn received_message_never_merges_with_optimistic_send() {
+        let mut index = MessageIndex::default();
+        let mut messages = Vec::new();
+
+        assert!(index.insert_or_merge(&mut messages, &message("sending_1", "hello", 1_000, 2)));
+        // An incoming (type 1) message with the same body is not an echo.
+        assert!(index.insert_or_merge(&mut messages, &message("55", "hello", 1_100, 1)));
+        assert_eq!(messages.len(), 2);
+    }
+
+    #[test]
+    fn rebuild_after_sort_restores_index_positions() {
+        let mut index = MessageIndex::default();
+        let mut messages = Vec::new();
+
+        for (i, date) in [(0, 3_000), (1, 1_000), (2, 2_000)] {
+            let m = message(&format!("id_{i}"), &format!("body_{i}"), date, 1);
+            assert!(index.insert_or_merge(&mut messages, &m));
+        }
+        assert!(index.insert_or_merge(&mut messages, &message("sending_4", "mine", 4_000, 2)));
+
+        messages.sort_by_key(|m| m.date);
+        index.rebuild(&messages);
+
+        // Duplicates are still detected after the rebuild...
+        for i in 0..3 {
+            let m = message(&format!("id_{i}"), "changed body", 9_999, 1);
+            assert!(!index.insert_or_merge(&mut messages, &m));
+        }
+        // ...and the pending outgoing message still matches its echo.
+        assert!(!index.insert_or_merge(&mut messages, &message("99", "mine", 4_500, 2)));
+        assert_eq!(messages.len(), 4);
+        assert_eq!(messages[3].id, "99");
     }
 }
 
@@ -125,6 +301,7 @@ impl Application for SmsWindow {
             selected_thread: None,
             contact_idx: Some(0),
             messages: Vec::new(),
+            message_index: MessageIndex::default(),
             messages_window_size: INITIAL_MESSAGES_WINDOW,
             message_input: String::new(),
             search_query: String::new(),
@@ -291,6 +468,9 @@ impl Application for SmsWindow {
                 self.contacts_by_phone = contacts
                     .into_iter()
                     .map(|(phone, name)| (utils::normalize_phone_number(&phone), name))
+                    // Degenerate entries (e.g. a "+" number normalizing to
+                    // "") must never be lookup targets.
+                    .filter(|(digits, _)| digits.len() >= utils::MIN_LOOKUP_DIGITS)
                     .collect();
                 self.update_conversation_names();
             }
@@ -425,6 +605,7 @@ impl Application for SmsWindow {
                 }
                 self.selected_thread = Some(thread_id.clone());
                 self.messages.clear();
+                self.message_index.clear();
                 self.messages_window_size = INITIAL_MESSAGES_WINDOW;
                 let device_id = self.device_id.clone();
                 let device_id2 = device_id.clone();
@@ -501,6 +682,7 @@ impl Application for SmsWindow {
                     read: true,
                 });
                 self.messages.sort_by_key(|m| m.date);
+                self.message_index.rebuild(&self.messages);
                 self.message_input.clear();
 
                 // Update the conversation preview and timestamp so it sorts to
@@ -563,7 +745,8 @@ impl Application for SmsWindow {
                         0,
                         Conversation {
                             thread_id: thread_id.clone(),
-                            phone_number: phone,
+                            phone_number: phone.clone(),
+                            addresses: vec![phone],
                             contact_name: String::new(),
                             last_message: String::new(),
                             timestamp: utils::now_millis(),
@@ -602,6 +785,7 @@ impl Application for SmsWindow {
                 if self.selected_thread.as_deref() == Some(thread_id.as_str()) {
                     self.selected_thread = None;
                     self.messages.clear();
+                    self.message_index.clear();
                 }
 
                 let device_id = self.device_id.clone();
@@ -637,13 +821,7 @@ impl SmsWindow {
             .pending_delete_thread
             .as_ref()
             .and_then(|tid| self.conversations.iter().find(|c| &c.thread_id == tid))
-            .map(|c| {
-                self.contacts
-                    .iter()
-                    .find(|(phone, _)| utils::phone_numbers_match(&c.phone_number, phone))
-                    .map(|(_, name)| name.clone())
-                    .unwrap_or_else(|| c.phone_number.clone())
-            })
+            .map(|c| c.display_name())
             .unwrap_or_default();
 
         widget::dialog()
@@ -754,24 +932,8 @@ impl SmsWindow {
                     .or_insert(0);
                 *seen = (*seen).max(message.date);
 
-                let already_exists = self.messages.iter().any(|m| {
-                    m.id == message.id
-                        || (m.id.starts_with("sending_")
-                            && m.type_ == 2
-                            && message.type_ == 2
-                            && m.body == message.body
-                            && (m.date - message.date).abs() < 300_000)
-                });
-
-                if !already_exists {
-                    self.messages.push(message.clone());
-                } else if let Some(existing) = self.messages.iter_mut().find(|m| {
-                    m.id.starts_with("sending_") && m.type_ == 2 && m.body == message.body
-                }) {
-                    existing.id = message.id.clone();
-                    existing.thread_id = message.thread_id.clone();
-                    existing.date = message.date;
-                }
+                self.message_index
+                    .insert_or_merge(&mut self.messages, &message);
             }
 
             if let Some(conv) = self
@@ -791,6 +953,8 @@ impl SmsWindow {
         // every individual message.
         if is_selected(&selected.as_deref().unwrap_or_default()) && !self.messages.is_empty() {
             self.messages.sort_by_key(|m| m.date);
+            // Sorting invalidated every indexed position; rebuild from scratch.
+            self.message_index.rebuild(&self.messages);
 
             // Persist the last-seen timestamp once for the whole batch.
             let device_id = self.device_id.clone();
@@ -805,13 +969,19 @@ impl SmsWindow {
 
     fn update_conversation_names(&mut self) {
         for conv in &mut self.conversations {
-            if let Some(name) = self
-                .contacts_by_phone
-                .get(&utils::normalize_phone_number(&conv.phone_number))
-                .cloned()
-            {
-                conv.contact_name = name;
-            }
+            // Group threads have no protocol-provided name; build one from
+            // every participant instead of just the newest message's first
+            // address.
+            let addresses = if conv.addresses.is_empty() {
+                std::slice::from_ref(&conv.phone_number)
+            } else {
+                conv.addresses.as_slice()
+            };
+            conv.contact_name = if self.contacts_by_phone.is_empty() {
+                String::new()
+            } else {
+                utils::resolve_conversation_name(addresses, &self.contacts_by_phone)
+            };
         }
     }
 }

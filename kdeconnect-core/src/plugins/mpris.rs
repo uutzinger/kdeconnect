@@ -233,36 +233,74 @@ pub async fn download_album_art(
     player: &str,
     album_art_url: &str,
     info: &PacketPayloadTransferInfo,
+    expected_size: Option<u64>,
+    transfer: Option<crate::filetransfer::IncomingTransfer>,
 ) -> anyhow::Result<String> {
-    let cache_dir = dirs::cache_dir()
-        .unwrap_or_else(|| std::path::PathBuf::from("/tmp"))
-        .join("kdeconnect/album_art");
-    tokio::fs::create_dir_all(&cache_dir).await?;
+    let result: Result<(std::path::PathBuf, u64), (&'static str, anyhow::Error)> = async {
+        let cache_dir = dirs::cache_dir()
+            .unwrap_or_else(|| std::path::PathBuf::from("/tmp"))
+            .join("kdeconnect/album_art");
+        tokio::fs::create_dir_all(&cache_dir)
+            .await
+            .map_err(|e| ("destination", anyhow::Error::new(e).context("creating cache dir")))?;
 
-    // Hash the remote URL so each distinct track gets its own file — avoids
-    // serving stale art from a path iced/cosmic may have already cached.
-    let hash = album_art_url
-        .bytes()
-        .fold(0u64, |h, b| h.wrapping_mul(31).wrapping_add(b as u64));
-    let sanitized_player: String = player
-        .chars()
-        .map(|c| if c.is_alphanumeric() { c } else { '_' })
-        .collect();
-    let filename = format!(
-        "{}_{}_{:x}.art",
-        device.device_id.0, sanitized_player, hash
-    );
-    let download = crate::download::Download::new(&cache_dir, &filename)?;
-    let mut file = download.writer()?;
+        // Hash the remote URL so each distinct track gets its own file — avoids
+        // serving stale art from a path iced/cosmic may have already cached.
+        let hash = album_art_url
+            .bytes()
+            .fold(0u64, |h, b| h.wrapping_mul(31).wrapping_add(b as u64));
+        let sanitized_player: String = player
+            .chars()
+            .map(|c| if c.is_alphanumeric() { c } else { '_' })
+            .collect();
+        let filename = format!(
+            "{}_{}_{:x}.art",
+            device.device_id.0, sanitized_player, hash
+        );
+        let download = crate::download::Download::new(&cache_dir, &filename)
+            .map_err(|e| ("destination", e.context("preparing destination file")))?;
+        let mut file = download
+            .writer()
+            .map_err(|e| ("destination", e.context("opening destination file")))?;
 
-    let mut remote_addr = device.address;
-    remote_addr.set_port(info.port);
+        let mut remote_addr = device.address;
+        remote_addr.set_port(info.port);
 
-    receive_payload(device, &remote_addr, &mut file).await?;
-    drop(file);
-    let dest = download.finish(false)?;
+        let progress_fn;
+        let progress_cb: Option<&(dyn Fn(u64) + Send + Sync)> = match &transfer {
+            Some(t) => {
+                progress_fn = move |bytes: u64| t.progress(bytes);
+                Some(&progress_fn)
+            }
+            None => None,
+        };
 
-    Ok(dest.to_string_lossy().into_owned())
+        let received = receive_payload(device, &remote_addr, &mut file, expected_size, progress_cb)
+            .await
+            .map_err(|e| (e.stage, anyhow::Error::new(e)))?;
+        drop(file);
+        let dest = download
+            .finish(false)
+            .map_err(|e| ("publish", e.context("publishing album art to cache")))?;
+
+        Ok((dest, received))
+    }
+    .await;
+
+    match result {
+        Ok((dest, bytes)) => {
+            if let Some(t) = transfer {
+                t.completed(dest.clone(), bytes);
+            }
+            Ok(dest.to_string_lossy().into_owned())
+        }
+        Err((stage, e)) => {
+            if let Some(t) = transfer {
+                t.failed(stage, format!("{:#}", e));
+            }
+            Err(e)
+        }
+    }
 }
 
 impl MprisRequest {

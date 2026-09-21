@@ -360,14 +360,30 @@ pub fn parse_sms_messages(messages_json: &str) -> (Vec<Message>, Vec<Conversatio
         groups.entry(msg.thread_id.clone()).or_default().push(msg);
     }
 
+    // Full participant roster per thread, from the core messages — each
+    // carries every recipient of a group MMS/RCS, while `Message.address`
+    // keeps only the first.
+    let mut thread_addresses: HashMap<String, Vec<String>> = HashMap::new();
+    for msg in &sms_messages {
+        let entry = thread_addresses
+            .entry(msg.thread_id.to_string())
+            .or_default();
+        for a in &msg.addresses {
+            if !a.address.is_empty() && !entry.contains(&a.address) {
+                entry.push(a.address.clone());
+            }
+        }
+    }
+
     let conversations: Vec<Conversation> = groups
         .into_iter()
         .map(|(thread_id, mut msgs)| {
             msgs.sort_by(|a, b| b.date.cmp(&a.date));
             let last = msgs.first().unwrap();
             Conversation {
-                thread_id,
                 phone_number: last.address.clone(),
+                addresses: thread_addresses.remove(&thread_id).unwrap_or_default(),
+                thread_id,
                 last_message: last.body.clone(),
                 timestamp: last.date,
                 unread: msgs.iter().any(|m| !m.read),
@@ -377,4 +393,55 @@ pub fn parse_sms_messages(messages_json: &str) -> (Vec<Message>, Vec<Conversatio
         .collect();
 
     (messages, conversations)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::parse_sms_messages;
+
+    #[test]
+    fn group_thread_collects_all_participant_addresses() {
+        let json = r#"{
+            "messages": [
+                {"_id": 1, "thread_id": 268, "date": 2000, "type": 2, "read": 1,
+                 "body": "outgoing",
+                 "addresses": [{"address": "+1-555-111-0001"}, {"address": "+1-555-111-0002"}]},
+                {"_id": 2, "thread_id": 268, "date": 1000, "type": 1, "read": 1,
+                 "body": "incoming",
+                 "addresses": [{"address": "+1-555-111-0002"}, {"address": "+1-555-111-0003"}]}
+            ]
+        }"#;
+
+        let (messages, conversations) = parse_sms_messages(json);
+        assert_eq!(messages.len(), 2);
+        assert_eq!(conversations.len(), 1);
+
+        let conv = &conversations[0];
+        // The newest message still picks the primary number...
+        assert_eq!(conv.phone_number, "+1-555-111-0001");
+        // ...but the roster is the union across the whole thread, deduped.
+        assert_eq!(
+            conv.addresses,
+            vec![
+                "+1-555-111-0001".to_string(),
+                "+1-555-111-0002".to_string(),
+                "+1-555-111-0003".to_string()
+            ]
+        );
+    }
+
+    #[test]
+    fn thread_without_addresses_yields_empty_roster() {
+        let json = r#"{
+            "messages": [
+                {"_id": 1, "thread_id": 7, "date": 1000, "type": 1, "read": 1,
+                 "body": "hi", "addresses": []}
+            ]
+        }"#;
+
+        let (_, conversations) = parse_sms_messages(json);
+        assert_eq!(conversations.len(), 1);
+        assert!(conversations[0].addresses.is_empty());
+        assert_eq!(conversations[0].display_name(), "");
+    }
 }

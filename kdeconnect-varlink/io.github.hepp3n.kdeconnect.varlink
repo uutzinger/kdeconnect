@@ -41,6 +41,7 @@ method RequestContacts(device_id: string) -> ()
 method GetCachedContacts(device_id: string) -> (json: string)
 method GetCachedContactPhotos(device_id: string) -> (json: string)
 method RequestSmsAttachment(device_id: string, part_id: int, unique_identifier: string) -> ()
+method GetRecentTransfers(device_id: string) -> (json: string)
 
 method Subscribe() -> (
     event_type: string,

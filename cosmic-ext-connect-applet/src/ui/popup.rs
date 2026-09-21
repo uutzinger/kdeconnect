@@ -6,17 +6,29 @@ use cosmic::widget::Row;
 use cosmic::{Element, widget};
 use std::collections::HashMap;
 
+/// Everything the popup view renders, borrowed from the applet.
+pub struct PopupState<'a> {
+    pub devices: &'a HashMap<String, Device>,
+    pub expanded_device: Option<&'a String>,
+    pub pairing_requests: Option<&'a HashMap<String, String>>,
+    pub unread_sms: &'a HashMap<String, bool>,
+    pub error_banner: Option<&'a String>,
+    pub now_playing: &'a HashMap<String, NowPlaying>,
+    pub recent_transfers: &'a std::collections::VecDeque<kdeconnect_core::event::TransferStatus>,
+}
+
 /// Build the popup view using the real application Core so popup_container
 /// has proper applet context, theme, and sizing.
-pub fn create_popup_view<'a>(
-    core: &'a Core,
-    devices: &'a HashMap<String, Device>,
-    expanded_device: Option<&'a String>,
-    pairing_requests: Option<&'a HashMap<String, String>>,
-    unread_sms: &'a HashMap<String, bool>,
-    error_banner: Option<&'a String>,
-    now_playing: &'a HashMap<String, NowPlaying>,
-) -> Element<'a, Message> {
+pub fn create_popup_view<'a>(core: &'a Core, state: &PopupState<'a>) -> Element<'a, Message> {
+    let PopupState {
+        devices,
+        expanded_device,
+        pairing_requests,
+        unread_sms,
+        error_banner,
+        now_playing,
+        recent_transfers,
+    } = *state;
     let spacing = cosmic::theme::active().cosmic().spacing;
     let mut content = widget::Column::new()
         .spacing(spacing.space_s)
@@ -146,11 +158,17 @@ pub fn create_popup_view<'a>(
 
         for device in paired_devices {
             let device_unread = unread_sms.get(&device.id).copied().unwrap_or(false);
+            let device_transfers: Vec<&kdeconnect_core::event::TransferStatus> = recent_transfers
+                .iter()
+                .filter(|s| s.device_id == device.id)
+                .take(3)
+                .collect();
             content = content.push(create_device_card(
                 device,
                 &spacing,
                 expanded_device,
                 device_unread,
+                device_transfers,
             ));
         }
     }
@@ -192,6 +210,7 @@ fn create_device_card<'a>(
     spacing: &cosmic::cosmic_theme::Spacing,
     expanded_device: Option<&'a String>,
     has_unread_sms: bool,
+    transfers: Vec<&'a kdeconnect_core::event::TransferStatus>,
 ) -> Element<'a, Message> {
     let is_expanded = expanded_device == Some(&device.id);
     let is_online = device.is_reachable;
@@ -327,6 +346,48 @@ fn create_device_card<'a>(
                         quick_actions_list.add(device.share_progress.map(|progress| {
                             widget::progress_bar::determinate_linear(progress as f32 / 100.0)
                         }));
+                }
+
+                // Recent incoming transfers: receiving progress, saved path
+                // on completion, stage/reason on failure.
+                for transfer in transfers {
+                    use kdeconnect_core::event::TransferState;
+                    let name = transfer
+                        .filename
+                        .clone()
+                        .unwrap_or_else(|| "file".to_string());
+                    match &transfer.state {
+                        TransferState::Receiving => {
+                            let mut col = widget::Column::new().push(widget::text::caption(
+                                fl!("transfer-receiving", name = name.as_str()),
+                            ));
+                            if let Some(expected) = transfer.expected_size.filter(|e| *e > 0) {
+                                col = col.push(widget::progress_bar::determinate_linear(
+                                    (transfer.received_bytes as f32 / expected as f32).min(1.0),
+                                ));
+                            }
+                            quick_actions_list = quick_actions_list.add(col);
+                        }
+                        TransferState::Completed => {
+                            let mut col = widget::Column::new().push(widget::text::caption(
+                                fl!("transfer-completed", name = name.as_str()),
+                            ));
+                            if let Some(path) = &transfer.saved_path {
+                                col = col.push(widget::text(path).size(10));
+                            }
+                            quick_actions_list = quick_actions_list.add(col);
+                        }
+                        TransferState::Failed { stage, reason } => {
+                            quick_actions_list = quick_actions_list.add(
+                                widget::Column::new()
+                                    .push(widget::text::caption(fl!(
+                                        "transfer-failed",
+                                        name = name.as_str()
+                                    )))
+                                    .push(widget::text(format!("{stage}: {reason}")).size(10)),
+                            );
+                        }
+                    }
                 }
             }
 

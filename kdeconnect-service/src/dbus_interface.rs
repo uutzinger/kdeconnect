@@ -24,6 +24,35 @@ const CONTACTS_PATH: &str = "/io/github/hepp3n/kdeconnect/Contacts";
 
 pub(crate) type SmsCache = Arc<Mutex<HashMap<String, Arc<str>>>>;
 
+/// Bounded list of the most recent transfer statuses, newest first.
+/// Progress updates replace the entry for their transfer ID, so the list
+/// holds at most one entry per transfer and `MAX_RECENT_TRANSFERS` entries
+/// overall. Shared between the Daemon D-Bus interface (signal + method),
+/// the varlink server, and the core event handler.
+pub(crate) type RecentTransfers =
+    Arc<Mutex<std::collections::VecDeque<kdeconnect_core::event::TransferStatus>>>;
+
+pub(crate) const MAX_RECENT_TRANSFERS: usize = 50;
+
+/// Records one transfer status: updates in place when the transfer ID is
+/// already present, otherwise prepends and trims the tail to stay bounded.
+pub(crate) fn record_transfer_status(
+    list: &mut std::collections::VecDeque<kdeconnect_core::event::TransferStatus>,
+    status: &kdeconnect_core::event::TransferStatus,
+) {
+    if let Some(existing) = list
+        .iter_mut()
+        .find(|s| s.transfer_id == status.transfer_id)
+    {
+        *existing = status.clone();
+    } else {
+        list.push_front(status.clone());
+        while list.len() > MAX_RECENT_TRANSFERS {
+            list.pop_back();
+        }
+    }
+}
+
 pub(crate) async fn cached_sms(cache: &SmsCache, device_id: &str) -> Option<Arc<str>> {
     cache.lock().await.get(device_id).cloned()
 }
@@ -176,6 +205,7 @@ pub struct DaemonInterface {
     event_sender: Arc<mpsc::UnboundedSender<AppEvent>>,
     devices: Arc<Mutex<HashMap<String, DbusDevice>>>,
     clipboard: Option<ClipboardHandle>,
+    recent_transfers: RecentTransfers,
 }
 
 pub(crate) async fn send_clipboard_packet(
@@ -498,6 +528,30 @@ impl DaemonInterface {
         progress: u8,
     ) -> zbus::Result<()>;
 
+    /// Signal: structured status of one payload transfer (progress or
+    /// terminal result). `status_json` is a serialized
+    /// `kdeconnect_core::event::TransferStatus`; updates for the same
+    /// transfer ID supersede earlier ones.
+    #[zbus(signal)]
+    async fn transfer_status(
+        signal_emitter: &SignalEmitter<'_>,
+        device_id: String,
+        status_json: String,
+    ) -> zbus::Result<()>;
+
+    /// Recent transfer statuses for one device as a JSON array, newest
+    /// first — the bounded list the `transfer_status` signal draws from,
+    /// so a freshly started client can see results from before it
+    /// subscribed.
+    async fn get_recent_transfers(&self, device_id: String) -> String {
+        let list = self.recent_transfers.lock().await;
+        let statuses: Vec<_> = list
+            .iter()
+            .filter(|s| s.device_id == device_id)
+            .collect();
+        serde_json::to_string(&statuses).unwrap_or_else(|_| "[]".to_string())
+    }
+
     #[zbus(signal)]
     async fn device_connected(
         signal_emitter: &SignalEmitter<'_>,
@@ -799,6 +853,7 @@ pub struct KdeConnectService {
     devices: Arc<Mutex<HashMap<String, DbusDevice>>>,
     sms_cache: SmsCache,
     clipboard: Option<ClipboardHandle>,
+    recent_transfers: RecentTransfers,
 }
 
 impl KdeConnectService {
@@ -819,6 +874,7 @@ impl KdeConnectService {
         let devices = self.devices.clone();
         let sms_cache = self.sms_cache.clone();
         let clipboard = self.clipboard.clone();
+        let recent_transfers = self.recent_transfers.clone();
         tokio::spawn(async move {
             if let Err(e) =
                 crate::varlink_server::run_varlink_server(
@@ -827,6 +883,7 @@ impl KdeConnectService {
                     sms_cache,
                     clipboard,
                     broadcast_tx,
+                    recent_transfers,
                 )
                     .await
             {
@@ -868,7 +925,8 @@ impl KdeConnectService {
 
 #[cfg(test)]
 mod tests {
-    use super::{SmsCache, cache_sms, cached_sms};
+    use super::{MAX_RECENT_TRANSFERS, SmsCache, cache_sms, cached_sms, record_transfer_status};
+    use kdeconnect_core::event::{TransferDirection, TransferState, TransferStatus};
     use std::{collections::HashMap, sync::Arc};
     use tokio::sync::Mutex;
 
@@ -881,6 +939,43 @@ mod tests {
         assert!(cached_sms(&cache, "missing").await.is_none());
         assert!(cached_sms(&cache, "phone-a").await.unwrap().contains("\"_id\":1"));
         assert!(cached_sms(&cache, "phone-b").await.unwrap().contains("\"_id\":2"));
+    }
+
+    fn transfer(id: &str, bytes: u64) -> TransferStatus {
+        TransferStatus {
+            transfer_id: id.into(),
+            device_id: "phone".into(),
+            direction: TransferDirection::Incoming,
+            filename: Some("f.bin".into()),
+            expected_size: None,
+            received_bytes: bytes,
+            state: TransferState::Receiving,
+            saved_path: None,
+        }
+    }
+
+    #[test]
+    fn recent_transfers_update_in_place_and_stay_bounded() {
+        let mut list = std::collections::VecDeque::new();
+
+        // Progress for the same transfer ID updates the existing entry
+        // instead of flooding the list.
+        record_transfer_status(&mut list, &transfer("a", 10));
+        record_transfer_status(&mut list, &transfer("a", 20));
+        assert_eq!(list.len(), 1);
+        assert_eq!(list[0].received_bytes, 20);
+
+        // Distinct transfers accumulate newest-first up to the cap.
+        for i in 0..(MAX_RECENT_TRANSFERS + 10) {
+            record_transfer_status(&mut list, &transfer(&format!("t{i}"), 0));
+        }
+        assert_eq!(list.len(), MAX_RECENT_TRANSFERS);
+        assert_eq!(
+            list.front().unwrap().transfer_id,
+            format!("t{}", MAX_RECENT_TRANSFERS + 9)
+        );
+        // "a" was trimmed from the tail.
+        assert!(!list.iter().any(|s| s.transfer_id == "a"));
     }
 }
 impl KdeConnectService {
@@ -944,10 +1039,14 @@ impl KdeConnectService {
             }
         }
 
+        let recent_transfers: RecentTransfers =
+            Arc::new(Mutex::new(std::collections::VecDeque::new()));
+
         let daemon_interface = DaemonInterface {
             event_sender: event_sender.clone(),
             devices: devices.clone(),
             clipboard: clipboard.clone(),
+            recent_transfers: recent_transfers.clone(),
         };
         connection
             .object_server()
@@ -982,6 +1081,7 @@ impl KdeConnectService {
         let event_sender_clone = event_sender.clone();
         let broadcast_tx_clone = broadcast_tx.clone();
         let sms_cache_for_service = sms_cache.clone();
+        let recent_transfers_for_service = recent_transfers.clone();
 
         tokio::spawn(async move {
             debug!("Event handler started");
@@ -994,6 +1094,7 @@ impl KdeConnectService {
                     &sms_cache,
                     &current_device_id,
                     &broadcast_tx_clone,
+                    &recent_transfers,
                 )
                 .await
                 {
@@ -1066,6 +1167,7 @@ impl KdeConnectService {
             devices,
             sms_cache: sms_cache_for_service,
             clipboard,
+            recent_transfers: recent_transfers_for_service,
         })
     }
 
@@ -1080,6 +1182,7 @@ impl KdeConnectService {
         sms_cache: &SmsCache,
         current_device_id: &Arc<Mutex<Option<String>>>,
         broadcast_tx: &broadcast::Sender<crate::varlink_server::VarlinkEvent>,
+        recent_transfers: &RecentTransfers,
     ) -> Result<()> {
         match event {
             ConnectionEvent::Connected((device_id, device)) => {
@@ -1413,6 +1516,54 @@ impl KdeConnectService {
                     .await?;
 
                 debug!("UpdateTransferProgress D-Bus signal emitted");
+            }
+            ConnectionEvent::TransferStatus(status) => {
+                use kdeconnect_core::event::TransferState;
+                match &status.state {
+                    TransferState::Receiving => debug!(
+                        "transfer {}: receiving '{}' ({} bytes so far)",
+                        status.transfer_id,
+                        status.filename.as_deref().unwrap_or("<unnamed>"),
+                        status.received_bytes
+                    ),
+                    TransferState::Completed => info!(
+                        "transfer {}: completed '{}' -> {:?} ({} bytes)",
+                        status.transfer_id,
+                        status.filename.as_deref().unwrap_or("<unnamed>"),
+                        status.saved_path,
+                        status.received_bytes
+                    ),
+                    TransferState::Failed { stage, reason } => warn!(
+                        "transfer {}: FAILED '{}' at {}: {}",
+                        status.transfer_id,
+                        status.filename.as_deref().unwrap_or("<unnamed>"),
+                        stage,
+                        reason
+                    ),
+                }
+
+                record_transfer_status(&mut *recent_transfers.lock().await, &status);
+
+                let status_json = serde_json::to_string(&*status)?;
+
+                let iface_ref = connection
+                    .object_server()
+                    .interface::<_, DaemonInterface>(DAEMON_PATH)
+                    .await?;
+
+                DaemonInterface::transfer_status(
+                    iface_ref.signal_emitter(),
+                    status.device_id.clone(),
+                    status_json.clone(),
+                )
+                .await?;
+
+                let _ = broadcast_tx.send(crate::varlink_server::VarlinkEvent {
+                    event_type: "transfer_status".into(),
+                    device_id: status.device_id.clone(),
+                    message: Some(status_json),
+                    ..Default::default()
+                });
             }
             ConnectionEvent::PairingRequested((device_id, device_name)) => {
                 info!("Pairing requested by {} ({})", device_name, device_id.0);

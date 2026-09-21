@@ -30,7 +30,14 @@ pub struct KdeConnectApplet {
     /// Media section state, keyed by MPRIS D-Bus bus name. Refreshed by
     /// `backend::mpris_subscription`.
     now_playing: HashMap<String, NowPlaying>,
+    /// Recent payload transfers, newest first — one entry per transfer ID,
+    /// fed by the service's `transfer_status` signal and seeded from its
+    /// bounded recent-results list. Bounded to `MAX_RECENT_TRANSFERS`.
+    recent_transfers: std::collections::VecDeque<kdeconnect_core::event::TransferStatus>,
 }
+
+/// Cap on the applet-side recent transfer list shown in the popup.
+const MAX_RECENT_TRANSFERS: usize = 20;
 
 impl cosmic::Application for KdeConnectApplet {
     type Executor = cosmic::executor::Default;
@@ -65,6 +72,7 @@ impl cosmic::Application for KdeConnectApplet {
             unread_sms: HashMap::new(),
             error_banner: None,
             now_playing: HashMap::new(),
+            recent_transfers: std::collections::VecDeque::new(),
         };
 
         (app, Task::none())
@@ -275,6 +283,20 @@ impl cosmic::Application for KdeConnectApplet {
                     }
                 }
             }
+            Message::TransferStatusReceived(status) => {
+                if let Some(existing) = self
+                    .recent_transfers
+                    .iter_mut()
+                    .find(|s| s.transfer_id == status.transfer_id)
+                {
+                    *existing = status;
+                } else {
+                    self.recent_transfers.push_front(status);
+                    while self.recent_transfers.len() > MAX_RECENT_TRANSFERS {
+                        self.recent_transfers.pop_back();
+                    }
+                }
+            }
             Message::ShareClipboard(ref device_id) => {
                 let id = device_id.clone();
                 let result_device_id = id.clone();
@@ -473,12 +495,15 @@ impl cosmic::Application for KdeConnectApplet {
         }
         ui::popup::create_popup_view(
             &self.core,
-            &self.devices,
-            self.expanded_device.as_ref(),
-            Some(&self.pairing_requests),
-            &self.unread_sms,
-            self.error_banner.as_ref(),
-            &self.now_playing,
+            &ui::popup::PopupState {
+                devices: &self.devices,
+                expanded_device: self.expanded_device.as_ref(),
+                pairing_requests: Some(&self.pairing_requests),
+                unread_sms: &self.unread_sms,
+                error_banner: self.error_banner.as_ref(),
+                now_playing: &self.now_playing,
+                recent_transfers: &self.recent_transfers,
+            },
         )
     }
 
@@ -599,7 +624,33 @@ fn main() -> cosmic::iced::Result {
             .to_string_lossy()
             .to_string()
     });
-    if let Ok(mut child) = std::process::Command::new("kdeconnect-service")
+
+    // Retain the service's diagnostics instead of discarding them: route its
+    // stdout/stderr into a bounded log file (one generation of rotation at
+    // launch, capped at 1 MiB per generation). Transfer failures are only
+    // diagnosable after the fact if these survive the session.
+    let service_log = {
+        let log_dir = dirs::data_dir()
+            .unwrap_or_else(|| std::path::PathBuf::from("/tmp"))
+            .join("kdeconnect");
+        let _ = std::fs::create_dir_all(&log_dir);
+        let log_path = log_dir.join("service.log");
+        const MAX_LOG_BYTES: u64 = 1024 * 1024;
+        if std::fs::metadata(&log_path)
+            .map(|m| m.len() > MAX_LOG_BYTES)
+            .unwrap_or(false)
+        {
+            let _ = std::fs::rename(&log_path, log_dir.join("service.log.1"));
+        }
+        std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(log_path)
+            .ok()
+    };
+
+    let mut command = std::process::Command::new("kdeconnect-service");
+    command
         .env("HOME", &home)
         .env(
             "XDG_RUNTIME_DIR",
@@ -609,10 +660,26 @@ fn main() -> cosmic::iced::Result {
             "XDG_CONFIG_HOME",
             std::env::var("XDG_CONFIG_HOME").unwrap_or_default(),
         )
-        .stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .spawn()
+        // The service defaults to `warn`; keep `info`-level transfer
+        // diagnostics in the retained log unless the user chose a level.
+        .env("RUST_LOG", std::env::var("RUST_LOG").unwrap_or_else(|_| "info".into()))
+        .stdin(std::process::Stdio::null());
+
+    match service_log
+        .as_ref()
+        .and_then(|f| f.try_clone().ok().zip(f.try_clone().ok()))
+    {
+        Some((out, err)) => {
+            command.stdout(std::process::Stdio::from(out));
+            command.stderr(std::process::Stdio::from(err));
+        }
+        None => {
+            command.stdout(std::process::Stdio::null());
+            command.stderr(std::process::Stdio::null());
+        }
+    }
+
+    if let Ok(mut child) = command.spawn()
     {
         // Reap the child process when it exits so it does not become a zombie.
         // If the service is already running it exits immediately (D-Bus name

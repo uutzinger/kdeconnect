@@ -17,11 +17,15 @@ async fn main() -> Result<()> {
 
     let stderr_layer = tracing_subscriber::fmt::layer().with_writer(std::io::stderr);
 
-    if std::env::var("KDECONNECT_LOG_FILE").is_ok()
-        && std::path::Path::new("/.flatpak-info").exists()
-    {
+    // When KDECONNECT_LOG_FILE is set, additionally mirror all logging into
+    // <data_dir>/kdeconnect/service.log so diagnostics survive the session.
+    // Works on any platform; the applet-launched path needs no env var at
+    // all since the applet already redirects the service's stdout/stderr
+    // into that same file.
+    if std::env::var("KDECONNECT_LOG_FILE").is_ok_and(|v| !v.is_empty()) {
         let log_dir = dirs::data_dir()
-            .unwrap_or_else(|| std::path::PathBuf::from("/tmp"));
+            .unwrap_or_else(|| std::path::PathBuf::from("/tmp"))
+            .join("kdeconnect");
         let _ = std::fs::create_dir_all(&log_dir);
         let file = std::fs::OpenOptions::new()
             .create(true)

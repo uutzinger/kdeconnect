@@ -29,6 +29,11 @@ quick-actions-browse-device = Przeglądaj urządzenie
 quick-actions-unmount-device = Odmontuj urządzenie
 quick-actions-run-commands-header = Uruchom komendy
 
+# File transfers (popup)
+transfer-receiving = Odbieranie { $name }
+transfer-completed = Odebrano { $name }
+transfer-failed = Transfer nie powiódł się: { $name }
+
 # Run Command management (settings)
 run-commands-manage-header = Komendy (uruchomione z telefonu)
 run-commands-add-header = Dodaj nową komende
