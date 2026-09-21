@@ -2,7 +2,7 @@
 Name=KDE Connect Service (Background)
 Name[cs]=Služba KDE Connect (v pozadí)
 Name[pl]=Usługi KDE Connect (w tle)
-Exec=kdeconnect-service
+Exec=env KDECONNECT_LOG_FILE=1 RUST_LOG=info kdeconnect-service
 Terminal=false
 Type=Application
 NoDisplay=true

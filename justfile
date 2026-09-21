@@ -55,7 +55,7 @@ install-dbus-service:
 # Install XDG autostart entry
 install-autostart:
     mkdir -p {{XDG_CONFIG}}/autostart
-    sed 's|Exec=kdeconnect-service|Exec={{PREFIX}}/bin/kdeconnect-service|'         resources/{{APPID}}.daemon.desktop         > {{XDG_CONFIG}}/autostart/{{APPID}}.daemon.desktop
+    sed 's|^Exec=.*|Exec=env KDECONNECT_LOG_FILE=1 RUST_LOG=info {{PREFIX}}/bin/kdeconnect-service|'         resources/{{APPID}}.daemon.desktop         > {{XDG_CONFIG}}/autostart/{{APPID}}.daemon.desktop
 
 # Install systemd user service (optional — enables journalctl logging and systemctl control)
 install-systemd-service:

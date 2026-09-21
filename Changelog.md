@@ -52,7 +52,7 @@ Implemented SMS performance fixes, hardened `kdeconnect-core`/`kdeconnect-servic
   - `receive_payload` now enforces a 10 s connection deadline, a 15 s TLS-handshake deadline, and a 30 s read-inactivity deadline (a manual copy loop fails only when no bytes arrive for the full window, so large progressing transfers are unaffected) and returns the received byte count. Failures are stage-tagged via `PayloadError` (connect / tls-handshake / verify-peer / receive / size-validation / finalize) with the full error chain preserved.
 
 - `kdeconnect-core/src/event.rs`, `filetransfer.rs`
-  - Added structured `TransferStatus` events (transfer/device IDs, direction, filename, expected size, received bytes, receiving/completed/failed with stage+reason, saved path) and an `IncomingTransfer` reporter that emits throttled progress (200 ms) plus exactly one terminal result. All three receive paths (share, MMS attachment, MPRIS album art) report through it; dispatch logs request receipt, and invalid bodies/missing metadata log warnings.
+  - Added structured `TransferStatus` events (transfer/device IDs, direction, filename, expected size, received bytes, receiving/completed/failed with stage+reason, saved path) and an `IncomingTransfer` reporter that emits throttled progress (200 ms) plus exactly one terminal result. The user-facing receive paths (share, MMS attachment) report through it — album art is deliberately excluded as a cache side effect that would flood the list on every track change; dispatch logs request receipt, and invalid bodies/missing metadata log warnings.
 
 - `kdeconnect-core/src/plugins/share.rs`, `plugins/sms.rs`, `plugins/mpris.rs`
   - An unavailable or unwritable Downloads directory is now reported as a "destination"-stage failure instead of silently falling back to `/tmp`; temporary-file setup and final publication carry stage-tagged contextual errors. Notification failures are logged separately — a saved file stays a successful transfer.
@@ -65,7 +65,7 @@ Implemented SMS performance fixes, hardened `kdeconnect-core`/`kdeconnect-servic
 
 - `cosmic-ext-connect-applet`
   - The popup shows per-device incoming transfer state: receiving progress bars (when the size is announced), completed transfers with their saved path, and failures with stage and reason — seeded from the service's recent-results list and kept as a bounded (20) list. New `transfer-receiving`/`transfer-completed`/`transfer-failed` strings in English, Polish, and Czech.
-  - The service launch now routes the service's stdout/stderr into `~/.local/share/kdeconnect/service.log` (one 1 MiB rotation generation) instead of `/dev/null`, with `RUST_LOG=info` unless the user set a level. `kdeconnect-service` also honors `KDECONNECT_LOG_FILE` on all platforms, writing to the same path.
+  - The service launch now routes the service's stdout/stderr into `~/.local/share/kdeconnect/service.log` (one 1 MiB rotation generation) instead of `/dev/null`, with `RUST_LOG=info` unless the user set a level. `kdeconnect-service` also honors `KDECONNECT_LOG_FILE` on all platforms, writing to the same path, and the XDG autostart entry now launches the service with `KDECONNECT_LOG_FILE=1 RUST_LOG=info` so the normal login path retains logs too.
 
 ### SMS performance and correctness
 

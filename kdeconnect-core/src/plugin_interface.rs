@@ -319,13 +319,10 @@ impl PluginRegistry {
                         let player = player.clone();
                         let album_art_url = album_art_url.clone();
                         let art_tx = mpris_connection_tx.clone();
-                        let transfer = IncomingTransfer::new(
-                            mpris_connection_tx.clone(),
-                            &device.device_id,
-                            Some(format!("{player} album art")),
-                            payload_size,
-                        );
-                        transfer.started();
+                        // No transfer reporter: album art is a cache side
+                        // effect, not a user file transfer — reporting it
+                        // would flood the recent-transfers UI on every track
+                        // change. Failures still log below with full chain.
                         tokio::spawn(async move {
                             match plugins::mpris::download_album_art(
                                 &device,
@@ -333,7 +330,7 @@ impl PluginRegistry {
                                 &album_art_url,
                                 &info,
                                 payload_size,
-                                Some(transfer),
+                                None,
                             )
                             .await
                             {
