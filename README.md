@@ -1,8 +1,11 @@
 <!--suppress HtmlDeprecatedAttribute -->
 <div align="center">
   <h1>⚠️ WORK IN PROGRESS</h1>
+  <p>Changes to the upstream repo are summarized in </p>p
   <p>A native KDE Connect implementation for the COSMIC Desktop, written in Rust.<br>
   Many features are working but you may encounter bugs — please report them via <a href="https://github.com/hepp3n/kdeconnect/issues">GitHub Issues</a>.</p>
+  <br>
+  <p><a href="Changelog.md">Changelog</a></p>
   <br>
   <img alt="KDE Connect applet on COSMIC desktop environment" src="https://raw.githubusercontent.com/hepp3n/kdeconnect/refs/heads/master/resources/screenshots/applet.png" />
 </div>
