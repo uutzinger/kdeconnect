@@ -15,7 +15,7 @@ use tokio::{
     sync::{Mutex, Semaphore, mpsc, oneshot},
     time::MissedTickBehavior,
 };
-use tokio_rustls::TlsAcceptor;
+use tokio_rustls::{TlsAcceptor, TlsConnector, TlsStream};
 use tracing::{debug, info, warn};
 
 use crate::{
@@ -133,33 +133,65 @@ fn identity_raw(identity: &Identity) -> Vec<u8> {
     .expect("Failed to serialize identity packet")
 }
 
-/// Completes the identity/TLS handshake once a TCP stream to the peer exists
-/// (TCP: just accepted; UDP: just connected after discovery). Shared by both
-/// transports since the sequence — send our identity pre-TLS, accept TLS as
-/// server, send our filtered identity post-TLS, then hand off to
-/// `handle_connection` — is otherwise identical between them.
+/// The TCP initiator sends the plaintext identity and acts as TLS server.
+/// The accepted side has already consumed that identity and starts TLS directly.
+async fn establish_control_tls<S>(
+    mut stream: S,
+    our_identity: &Identity,
+    client_config: Arc<rustls::ClientConfig>,
+    server_config: Arc<rustls::ServerConfig>,
+    tls_server: bool,
+    id: &DeviceId,
+) -> anyhow::Result<TlsStream<S>>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
+    if tls_server {
+        stream.write_all(&identity_raw(our_identity)).await?;
+        stream.flush().await?;
+        Ok(TlsAcceptor::from(server_config)
+            .accept(stream)
+            .await?
+            .into())
+    } else {
+        let server_name = ServerName::try_from(id.0.clone())?;
+        Ok(TlsConnector::from(client_config)
+            .connect(server_name, stream)
+            .await?
+            .into())
+    }
+}
+
+/// Completes the identity/TLS handshake once a TCP stream to the peer exists.
+/// KDE Connect makes the TCP initiator the TLS server, so the TLS role depends
+/// on whether this stream was accepted or initiated locally.
 ///
 /// Callers should spawn this rather than awaiting it inline, so a slow or
 /// stalled peer can't block the accept/recv loop from handling others.
 async fn complete_handshake(
-    mut stream: TcpStream,
+    stream: TcpStream,
     our_identity: Arc<Identity>,
+    client_config: Arc<rustls::ClientConfig>,
     server_config: Arc<rustls::ServerConfig>,
+    tls_server: bool,
     peer: SocketAddr,
     id: DeviceId,
     name: String,
     event_tx: mpsc::UnboundedSender<TransportEvent>,
 ) {
-    if let Err(e) = stream.write_all(&identity_raw(&our_identity)).await {
-        warn!(peer = ?peer, "[handshake] failed to send pre-TLS identity: {}", e);
-        return;
-    }
-    let _ = stream.flush().await;
-
-    let mut tls_stream = match TlsAcceptor::from(server_config).accept(stream).await {
-        Ok(s) => s,
+    let mut tls_stream = match establish_control_tls(
+        stream,
+        &our_identity,
+        client_config,
+        server_config,
+        tls_server,
+        &id,
+    )
+    .await
+    {
+        Ok(stream) => stream,
         Err(e) => {
-            warn!(peer = ?peer, "[handshake] TLS accept failed: {}", e);
+            warn!(peer = ?peer, "[handshake] TLS handshake failed: {}", e);
             return;
         }
     };
@@ -232,6 +264,7 @@ pub struct TcpTransport {
     event_tx: mpsc::UnboundedSender<TransportEvent>,
     identity: Arc<Identity>,
     server_config: Arc<rustls::ServerConfig>,
+    client_config: Arc<rustls::ClientConfig>,
 }
 
 impl TcpTransport {
@@ -241,12 +274,14 @@ impl TcpTransport {
         let event_tx = event_tx.clone();
         let identity = Arc::new(config.identity.clone());
         let server_config = config.key_store.server_config.clone();
+        let client_config = config.key_store.client_config.clone();
 
         Self {
             listen_addr,
             event_tx,
             identity,
             server_config,
+            client_config,
         }
     }
 
@@ -275,6 +310,7 @@ impl TcpTransport {
 
                     let identity = self.identity.clone();
                     let server_config = self.server_config.clone();
+                    let client_config = self.client_config.clone();
                     let event_tx = self.event_tx.clone();
                     spawn_handshake(async move {
                         let peer_identity = match read_identity(&mut stream).await {
@@ -290,7 +326,9 @@ impl TcpTransport {
                         complete_handshake(
                             stream,
                             identity,
+                            client_config,
                             server_config,
+                            false,
                             peer,
                             DeviceId(peer_identity.device_id),
                             peer_identity.device_name,
@@ -314,6 +352,7 @@ pub struct UdpTransport {
     event_tx: mpsc::UnboundedSender<TransportEvent>,
     identity: Arc<Identity>,
     server_config: Arc<rustls::ServerConfig>,
+    client_config: Arc<rustls::ClientConfig>,
 }
 
 impl UdpTransport {
@@ -357,6 +396,7 @@ impl UdpTransport {
         let event_tx = event_tx.clone();
         let identity = Arc::new(config.identity.clone());
         let server_config = config.key_store.server_config.clone();
+        let client_config = config.key_store.client_config.clone();
 
         Self {
             socket,
@@ -364,6 +404,7 @@ impl UdpTransport {
             event_tx,
             identity,
             server_config,
+            client_config,
         }
     }
 
@@ -437,6 +478,7 @@ impl UdpTransport {
                     // unreachable peer can't block the UDP recv loop.
                     let identity = self.identity.clone();
                     let server_config = self.server_config.clone();
+                    let client_config = self.client_config.clone();
                     let event_tx = self.event_tx.clone();
                     spawn_handshake(async move {
                         let stream = match TcpStream::connect(peer).await {
@@ -452,7 +494,9 @@ impl UdpTransport {
                         complete_handshake(
                             stream,
                             identity,
+                            client_config,
                             server_config,
+                            true,
                             peer,
                             id,
                             name,
@@ -802,6 +846,70 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn control_tls_roles_preserve_identity_framing_and_peer_certificates() {
+        let (initiator_server, initiator_client, initiator_cert) = tls_configs();
+        let (accepted_server, accepted_client, accepted_cert) = tls_configs();
+        let (initiator_socket, mut accepted_socket) = tokio::io::duplex(16384);
+        let initiator_identity = identity();
+        let expected_id = initiator_identity.device_id.clone();
+        let initiator = async {
+            establish_control_tls(
+                initiator_socket,
+                &initiator_identity,
+                initiator_client,
+                initiator_server,
+                true,
+                &DeviceId("phone".into()),
+            )
+            .await
+            .unwrap()
+        };
+        let accepted = async {
+            let received = read_identity(&mut accepted_socket).await.unwrap();
+            assert_eq!(received.device_id, expected_id);
+            establish_control_tls(
+                accepted_socket,
+                &identity(),
+                accepted_client,
+                accepted_server,
+                false,
+                &DeviceId(received.device_id),
+            )
+            .await
+            .unwrap()
+        };
+        // Any plaintext identity sent by the accepted side would break TLS.
+        let (mut initiator, mut accepted) = tokio::time::timeout(Duration::from_secs(2), async {
+            tokio::join!(initiator, accepted)
+        })
+        .await
+        .unwrap();
+        assert!(matches!(initiator, TlsStream::Server(_)));
+        assert!(matches!(accepted, TlsStream::Client(_)));
+        assert_eq!(
+            initiator.get_ref().1.peer_certificates().unwrap()[0].as_ref(),
+            accepted_cert
+        );
+        assert_eq!(
+            accepted.get_ref().1.peer_certificates().unwrap()[0].as_ref(),
+            initiator_cert
+        );
+        tokio::time::timeout(Duration::from_secs(2), async {
+            initiator.write_all(b"ping\n").await.unwrap();
+            initiator.flush().await.unwrap();
+            let mut bytes = [0; 5];
+            accepted.read_exact(&mut bytes).await.unwrap();
+            assert_eq!(&bytes, b"ping\n");
+            accepted.write_all(b"pong\n").await.unwrap();
+            accepted.flush().await.unwrap();
+            initiator.read_exact(&mut bytes).await.unwrap();
+            assert_eq!(&bytes, b"pong\n");
+        })
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
     async fn payload_pin_is_checked_in_both_tls_directions() {
         let (server_config, _, server_cert) = tls_configs();
         let (_, client_config, client_cert) = tls_configs();
@@ -986,6 +1094,7 @@ mod tests {
             event_tx: tx,
             identity: Arc::new(identity()),
             server_config: tls_configs().0,
+            client_config: tls_configs().1,
         };
         let listener_task =
             tokio::spawn(async move { transport.accept_connections(listener).await });
