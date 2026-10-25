@@ -34,30 +34,9 @@ fn load_local_commands() -> Vec<LocalCommand> {
     }
 }
 
-fn save_local_commands(commands: &[LocalCommand]) {
-    let path = commands_config_path();
-    if let Some(parent) = path.parent() {
-        let _ = std::fs::create_dir_all(parent);
-    }
-    if let Ok(json) = serde_json::to_string(&commands) {
-        let _ = std::fs::write(&path, json);
-    }
-}
-
 // ---------------------------------------------------------------------------
 // Protocol structs
 // ---------------------------------------------------------------------------
-
-/// Incoming `kdeconnect.runcommand` from the phone (rare — phone also has
-/// its own commands, but the primary direction is desktop -> phone).
-#[derive(Serialize, Deserialize, Clone, Debug)]
-#[allow(dead_code)]
-pub struct RunCommand {
-    #[serde(rename = "commandList")]
-    pub command_list: String,
-    #[serde(rename = "canAddCommand", default)]
-    pub can_add_command: bool,
-}
 
 /// Incoming `kdeconnect.runcommand.request` from the phone:
 ///   - `key` -> execute the named command on this desktop
@@ -72,59 +51,6 @@ pub struct RunCommandRequest {
 // ---------------------------------------------------------------------------
 // Packet handlers
 // ---------------------------------------------------------------------------
-
-impl RunCommand {
-    /// Phone sent us an updated command list — save any new commands to disk.
-    pub async fn received_packet(
-        &self,
-        device: &crate::device::Device,
-        core_tx: mpsc::UnboundedSender<crate::event::CoreEvent>,
-    ) {
-        // Parse the commandList JSON string into individual commands.
-        let incoming: std::collections::HashMap<String, serde_json::Value> =
-            match serde_json::from_str(&self.command_list) {
-                Ok(map) => map,
-                Err(e) => {
-                    warn!("[runcommand] failed to parse commandList from {}: {}", device.device_id, e);
-                    return;
-                }
-            };
-
-        if incoming.is_empty() {
-            return;
-        }
-
-        // Merge into existing commands — add any that aren't already present by id.
-        let mut commands = load_local_commands();
-        let mut changed = false;
-        for (key, val) in &incoming {
-            let name = val["name"].as_str().unwrap_or("").to_string();
-            let command = val["command"].as_str().unwrap_or("").to_string();
-            if name.is_empty() || command.is_empty() {
-                continue;
-            }
-            if !commands.iter().any(|c| c.id == *key) {
-                commands.push(LocalCommand {
-                    id: key.clone(),
-                    name,
-                    command,
-                });
-                changed = true;
-            }
-        }
-
-        if changed {
-            save_local_commands(&commands);
-            info!(
-                "[runcommand] saved {} new command(s) from {}",
-                incoming.len(),
-                device.device_id
-            );
-            // Re-send updated list back to phone to confirm.
-            send_command_list(&device.device_id, core_tx).await;
-        }
-    }
-}
 
 impl RunCommandRequest {
     pub async fn received_packet(
@@ -183,7 +109,7 @@ impl RunCommandRequest {
 // ---------------------------------------------------------------------------
 
 /// Build and send a `kdeconnect.runcommand` packet to the phone containing
-/// all locally defined commands and `canAddCommand: true`.
+/// all locally defined commands and `canAddCommand: false`.
 ///
 /// Called on device connect (kdeconnect-core/src/lib.rs) and when the phone
 /// requests the list via `requestCommandList: true`.
@@ -193,34 +119,55 @@ pub async fn send_command_list(
 ) {
     let commands = load_local_commands();
 
-    // commandList must be a *JSON-encoded string*, not a nested object.
-    // Format: "{\"<uuid>\": {\"name\": \"...\", \"command\": \"...\"}, ...}"
-    let mut map = serde_json::Map::new();
-    for cmd in &commands {
-        map.insert(
-            cmd.id.clone(),
-            serde_json::json!({ "name": cmd.name, "command": cmd.command }),
-        );
-    }
-    let command_list_str = serde_json::to_string(&serde_json::Value::Object(map))
-        .unwrap_or_else(|_| "{}".to_string());
-
     info!(
         "[runcommand] sending {} command(s) to {}",
         commands.len(),
         device_id
     );
 
-    let packet = ProtocolPacket::new(
+    let _ = core_tx.send(crate::event::CoreEvent::SendPacket {
+        device: device_id.clone(),
+        packet: command_list_packet(&commands),
+    });
+}
+
+fn command_list_packet(commands: &[LocalCommand]) -> ProtocolPacket {
+    // commandList must be a *JSON-encoded string*, not a nested object.
+    // Format: "{\"<uuid>\": {\"name\": \"...\", \"command\": \"...\"}, ...}"
+    let mut map = serde_json::Map::new();
+    for cmd in commands {
+        map.insert(
+            cmd.id.clone(),
+            serde_json::json!({ "name": cmd.name, "command": cmd.command }),
+        );
+    }
+    let command_list_str =
+        serde_json::to_string(&serde_json::Value::Object(map)).unwrap_or_else(|_| "{}".to_string());
+
+    ProtocolPacket::new(
         PacketType::RunCommand,
         serde_json::json!({
             "commandList": command_list_str,
-            "canAddCommand": true,
+            "canAddCommand": false,
         }),
-    );
+    )
+}
 
-    let _ = core_tx.send(crate::event::CoreEvent::SendPacket {
-        device: device_id.clone(),
-        packet,
-    });
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn command_list_keeps_local_commands_but_disallows_remote_addition() {
+        let packet = command_list_packet(&[LocalCommand {
+            id: "approved-id".into(),
+            name: "Approved".into(),
+            command: "true".into(),
+        }]);
+        assert!(matches!(packet.packet_type, PacketType::RunCommand));
+        assert_eq!(packet.body["canAddCommand"], false);
+        let advertised: serde_json::Value =
+            serde_json::from_str(packet.body["commandList"].as_str().unwrap()).unwrap();
+        assert_eq!(advertised["approved-id"]["command"], "true");
+    }
 }

@@ -1,6 +1,24 @@
-# Changelog
+# Changelog for this fork of KDE Connect implementation for the COSMIC™
 
-## Changes made
+Entries run from oldest to newest; new updates are appended at the bottom.
+
+## Table of contents
+
+- [Initial security, reliability, and SMS improvements](#initial-security-reliability-and-sms-improvements)
+  - [Security](#security)
+  - [Reliability](#reliability)
+  - [Incoming file transfers](#incoming-file-transfers)
+  - [SMS performance and correctness](#sms-performance-and-correctness)
+  - [SMS per-device isolation](#sms-per-device-isolation)
+  - [i18n](#i18n)
+  - [Verified, no change needed](#verified-no-change-needed)
+  - [Tests](#tests)
+  - [Pending / not yet implemented](#pending--not-yet-implemented)
+- [Security follow-up - 2026-09-21](#security-follow-up---2026-09-21)
+- [Upstream merge - 2026-10-25](#upstream-merge---2026-10-25)
+- [Repeated phone notifications - 2026-10-25](#repeated-phone-notifications---2026-10-25)
+
+## Initial security, reliability, and SMS improvements
 
 Implemented SMS performance fixes, hardened `kdeconnect-core`/`kdeconnect-service` against panics and zombie processes, added certificate pinning and safe file reception, and scoped SMS data per device.
 
@@ -149,3 +167,29 @@ Implemented SMS performance fixes, hardened `kdeconnect-core`/`kdeconnect-servic
 - Rich-text span rebuilds in `mixed_emoji_text()` on every keystroke.
 - Best-effort silent channel sends (pairing acks, contacts/mpris bootstrap, broadcast fan-out).
 - Live-device validation (real phone transfer, DHCP/network-change payload address refresh, native and Flatpak log retention checks) — requires a running session and paired hardware.
+
+## Security follow-up - 2026-09-21
+
+- `kdeconnect-core/src/plugins/run_command.rs`, `plugin_interface.rs`: Ignore command-list packets received from phones instead of adding their contents to the executable desktop command store. Advertise `canAddCommand: false` while preserving execution of locally configured commands and requests for the approved list. Added a packet-format regression test.
+- Existing `runcommand.json` entries have no recorded source. Commands written by earlier versions remain until reviewed or removed in desktop settings; this change prevents new remote additions.
+- `kdeconnect-core/src/transport.rs`, `lib.rs`: Cap newline-framed control packets at 16 MiB and bound the transport-to-core event queue to 16 entries, applying backpressure to fast senders. Added tests for packet boundaries, EOF, oversized unterminated input, and delivery through a full queue. Core tests (31) and the offline workspace check passed.
+- `kdeconnect-core`, `kdeconnect-service`, `kdeconnect-dbus-client`, SMS window: Carry authenticated device IDs with contact and photo events, save caches under the source device, include IDs in D-Bus signals, and ignore other phones' updates in each SMS window. Use v2 cache filenames so previously mixed contact caches are not loaded; legacy cache files remain untouched. Correct vCard unfolding so padded base64 photos are not joined with the next property. Workspace tests passed (47 tests, one compositor-dependent test ignored), and the offline workspace check passed. Live two-phone validation is pending.
+- SMS window, D-Bus/Varlink client and service, core: Send one SMS request containing every distinct participant address in the conversation instead of only its primary number. Block sends when the roster contains an unusable group token, and preserve the roster and newest preview across partial updates. Added recipient-selection, partial-update, and packet tests; offline workspace tests passed (51 tests, one compositor-dependent test ignored), and the offline workspace check passed. The IPC signature changed, so restart the service and SMS window together. Live group delivery is pending.
+- `kdeconnect-service/src/dbus_interface.rs`: Merge incoming SMS batches into the per-device memory and disk cache by thread/message ID instead of replacing the cache with the last packet. Repeated messages update their cached copy; a cache miss resumes from disk. Live D-Bus signals remain incremental. Added partial-batch, update, and cross-thread identity tests; offline workspace tests passed (53 tests, one compositor-dependent test ignored), and the offline workspace check passed. Previously discarded history requires a phone resync; live offline/reconnect behavior remains pending.
+- `kdeconnect-core/src/plugins/share.rs`: End a file transfer with a `metadata` failure when the share packet lacks payload transfer information, so the UI cannot remain stuck at `Receiving`. Added a status-sequence regression test.
+- `kdeconnect-core/src/transport.rs`: Require an announced payload size and reject an over-limit read before writing it to disk, while continuing to reject truncated transfers at EOF. Added tests for early over-limit rejection, exact-size reception, and missing size metadata. Offline workspace tests passed (56 tests, one compositor-dependent test ignored), and the offline workspace check passed. Live phone transfer validation remains pending.
+
+## Upstream merge - 2026-10-25
+
+- Merged upstream `d038146` (TLS role fix) and its merge commit `36a44d9` (PR #119). Accepted TCP connections now use the TLS client role immediately after reading the peer identity; locally initiated connections retain the TLS server role and send the plaintext identity first.
+- Reconciled the transport conflict with our certificate pinning, core acceptance gate, handshake timeout/concurrency limit, bounded packet reader, and event queue. Use `tokio_rustls::TlsStream` to retain peer-certificate access in both TLS roles.
+- Added a regression test covering identity framing, both TLS roles, peer certificates, and bidirectional encrypted traffic. With the existing local fixes restored, `cargo test --workspace --locked --offline` passed 57 tests (one Wayland-dependent test ignored), `cargo check --workspace --locked --offline` passed, and `git diff --check` passed. Real-phone connection/reconnection remains unverified.
+- Reconciled the fork's two README commits. Pre-existing local changes remain uncommitted; the pre-merge stash is retained as a backup.
+
+## Repeated phone notifications - 2026-10-25
+
+- `kdeconnect-core/src/plugins/notification.rs`, `plugin_interface.rs`: Previously every displayable notification packet created a new desktop popup; the phone's ID and `silent` flag were unused. The two available service logs contained 699 displayable packets, including 631 repeats of an earlier notification ID and visible content, with a batch repeated about 28 minutes later. This confirms repeated input; it does not establish why the phone resent it.
+- Track the last visible-content fingerprint by authenticated device ID and phone notification ID. Suppress unchanged content despite refreshed timestamps, icon hashes, reply tokens, or actions. New IDs and changed visible content still display; different phones have independent identities. Respect `silent` and legacy `requestAnswer` sync flags. Cancellation packets release that phone's ID for reuse; closing an existing desktop notification from a phone cancellation remains unsupported.
+- Keep history across reconnects without a time-based expiry; bound it to the 4,096 most recently seen IDs. History resets on service restart or ID eviction and is not persisted. For the same active ID, identical visible content is treated as a replay even when the packet timestamp changes.
+- Use asynchronous notification display and log display failures instead of panicking. Failed displays remain retryable. Remove full notification-body logging; new debug logs report display/suppression without message content.
+- Validation: Six new policy regression tests passed. `cargo test --workspace --locked --offline` passed 63 tests with one Wayland-dependent test ignored; `cargo check --workspace --locked --offline` passed. No installation, restart, push, or live notification-daemon test was performed. Install the updated build and restart the service before checking phone behavior over the reported 30–60 minute interval.

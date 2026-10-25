@@ -118,7 +118,7 @@ pub enum ConnectionEvent {
     PairStateChanged((DeviceId, PairState)),
     Mpris((DeviceId, Mpris)),
     SmsMessages((DeviceId, SmsMessages)),
-    ContactsReceived(HashMap<String, String>),
+    ContactsReceived((DeviceId, HashMap<String, String>)),
     UpdateTransferProgress(u8),
     /// Structured status of an incoming/outgoing payload transfer —
     /// progress updates and the terminal result. Replaces the bare
@@ -144,7 +144,7 @@ pub enum ConnectionEvent {
     /// vcards already being parsed for `ContactsReceived`. Kept as base64
     /// the whole way to the UI (same as SMS thumbnails) rather than
     /// decoding here only to re-encode for the D-Bus signal/cache.
-    ContactPhotosReceived(HashMap<String, String>),
+    ContactPhotosReceived((DeviceId, HashMap<String, String>)),
 }
 
 #[cfg(test)]

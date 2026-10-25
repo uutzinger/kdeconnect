@@ -581,6 +581,13 @@ fn view_message_input<'a>(
 ) -> Element<'a, SmsMessage> {
     let message_placeholder = fl!("sms-message-placeholder");
 
+    let can_send = app.selected_thread.as_ref().and_then(|thread_id| {
+        app.conversations.iter().find(|conv| &conv.thread_id == thread_id)
+    }).and_then(Conversation::send_addresses).is_some();
+
+    let send_button = widget::button::suggested(fl!("sms-send"));
+    let send_button = if can_send { send_button.on_press(SmsMessage::SendMessage) } else { send_button };
+
     let input_row = widget::Row::new()
         .push(
             widget::button::icon(widget::icon::from_name("face-smile-symbolic").handle())
@@ -593,15 +600,18 @@ fn view_message_input<'a>(
         .push(
             widget::text_input(message_placeholder, &app.message_input)
                 .on_input(SmsMessage::UpdateInput)
-                .on_submit(|_| SmsMessage::SendMessage)
+                .on_submit(move |_| if can_send { SmsMessage::SendMessage } else { SmsMessage::RefreshThread })
                 .padding(spacing.space_s)
                 .width(Length::Fill),
         )
-        .push(widget::button::suggested(fl!("sms-send")).on_press(SmsMessage::SendMessage))
+        .push(send_button)
         .spacing(spacing.space_xs)
         .align_y(Alignment::Center);
 
     let mut col = widget::Column::new().spacing(spacing.space_xs);
+    if !can_send {
+        col = col.push(widget::text("Cannot send: recipients are unavailable or invalid."));
+    }
     if app.show_emoji_picker {
         col = col.push(view_emoji_picker(app, spacing));
     }

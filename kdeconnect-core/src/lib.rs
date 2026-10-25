@@ -44,7 +44,7 @@ pub struct KdeConnectCore {
     device_manager: Arc<DeviceManager>,
     pairing: Arc<PairingManager>,
     plugin_registry: Arc<PluginRegistry>,
-    transport_rx: mpsc::UnboundedReceiver<TransportEvent>,
+    transport_rx: mpsc::Receiver<TransportEvent>,
     writer_map: Arc<Mutex<HashMap<DeviceId, mpsc::UnboundedSender<ProtocolPacket>>>>,
     /// Tracks the conn_id of the most recently accepted connection per device.
     /// A `Disconnected` event whose conn_id doesn't match is from a superseded
@@ -81,7 +81,9 @@ impl KdeConnectCore {
             .set(config)
             .expect("Config already initialized");
 
-        let (transport_tx, transport_rx) = mpsc::unbounded_channel();
+        // Backpressure control packets instead of allowing a fast peer to
+        // queue unbounded raw JSON while the core processes earlier packets.
+        let (transport_tx, transport_rx) = mpsc::channel(16);
         let (event_tx, event_rx) = mpsc::unbounded_channel();
         let writer_map = Arc::new(Mutex::new(HashMap::new()));
         let conn_id_map = Arc::new(Mutex::new(HashMap::new()));
@@ -356,8 +358,7 @@ impl KdeConnectCore {
                         let _ = sender.send(contacts_pkt);
                     }
                     drop(guard);
-                    // Send our local command list so the Android app shows
-                    // the Run Command option (requires canAddCommand: true).
+                    // Send our local command list to the Android app.
                     plugins::run_command::send_command_list(&id, self.event_tx.clone()).await;
                     
                     if self.plugin_registry.is_plugin_enabled(&id.0, "systemvolume").await {

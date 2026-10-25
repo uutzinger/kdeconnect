@@ -8,6 +8,7 @@ P1 = high priority. P2 = normal priority. Reviews are ordered oldest first; appe
 
 - [First review - 2026-08-05](#first-review---2026-08-05)
 - [Second review - 2026-09-20](#second-review---2026-09-20)
+- [Third review - 2026-09-21](#third-review---2026-09-21)
 
 ## First Review - 2026-08-05
 
@@ -151,3 +152,59 @@ The reported missing image was not reproduced; its historical failure cause rema
 ⏳ **[P2] Live multi-phone validation**: Install/restart the updated service and verify two paired phones cannot populate each other's SMS window or cache. No service was installed or restarted during this implementation.
 
 ✅ **[P2] Test failures and a real phone transfer** (automated coverage): New tests cover stalled reception (read-inactivity deadline), slow-but-progressing transfers, progress/EOF byte accounting, short/excess/valid/unannounced payload sizes, malformed/unsafe filenames, simultaneous duplicate names, temporary-file cleanup, transfer reporter throttling with exactly one terminal result, `TransferStatus` JSON roundtrip (the D-Bus/varlink contract), and the bounded deduped recent-results list. Notification failure is handled as log-only while the saved file stays a successful transfer. The real-phone portion — sharing a known image and verifying contents, destination, UI status, and logs against an installed build — remains pending under Live-device validation.
+
+
+#### Suggested test pass
+- tail -F ~/.local/share/kdeconnect/service.log in a terminal.
+- Photo share from phone → popup shows receiving progress → completed with saved path; notification fires; log shows transfer <id>: ... completed.
+- MMS with image (your original missing-image case) → watch for transfer events/failures.
+- Text share and URL share → notification/browser (these were the silently-discarded ones).
+- Outgoing file to the phone → existing progress bar still works.
+- DHCP/network change: toggle the phone's Wi-Fi off/on (or switch networks), wait for reconnect, share again — should still land (FT-06 path).
+- Group SMS: thread name should now be "Amy, Clara"-style, not "skype".
+
+## Third Review - 2026-09-21
+
+Reviewed source at `5e7d117` against the preceding reviews and `Changelog.md`. Findings may reopen items previously marked fixed. The review itself involved no code changes, service installation/restart, or live phone/GUI validation; items 1–3 were fixed afterward as recorded below.
+
+1. ✅ **[P1] Paired phones could install and execute arbitrary desktop commands.** Previously, `kdeconnect-core/src/plugins/run_command.rs` merged phone-supplied commands into the desktop's local command store; a subsequent request could execute them through `sh -c`. The pairing gate blocked unpaired devices but did not require desktop approval of individual commands. Fixed by removing the inbound command-list handler and its write-to-`runcommand.json` path. The desktop now ignores unsolicited command lists and advertises `canAddCommand: false`; phones can still request the approved list and run locally configured commands by key. A packet test covers the advertised flag and command-list format. `cargo test -p kdeconnect-core --lib --locked --offline` passed 28 tests, including the loopback test run outside the sandbox; `cargo check --workspace --locked --offline` passed. Existing command files do not record whether earlier versions accepted an entry from a phone, so review any preexisting commands before trusting them. Live phone behavior remains unverified.
+
+2. ✅ **[P1] Unpaired peers could exhaust memory after completing TLS.** Previously, `kdeconnect-core/src/transport.rs` read control packets with an unbounded `read_line`, allowing a peer to keep sending bytes without a newline before packet parsing or the pairing check. The control reader now caps each newline-framed packet at 16 MiB and closes the connection when that limit is exceeded. The transport-to-core event channel now holds at most 16 queued events and applies backpressure to fast senders. Tests cover consecutive packets, EOF, oversized unterminated input, and delivery through a full queue. `cargo test -p kdeconnect-core --lib --locked --offline` passed 31 tests, including the loopback test run outside the sandbox; `cargo check --workspace --locked --offline` passed. Packets larger than 16 MiB are rejected, including unusually large legitimate sync responses. Live phone behavior remains unverified.
+
+3. ✅ **[P1] Multi-phone isolation was incomplete for contacts and photos.** The core previously emitted contact and photo events without their source device, so the service saved them under the most recently connected phone and every SMS window accepted their signals. Both core events now carry the authenticated `DeviceId`; service cache writes and D-Bus signals use that ID, including cached contacts emitted on reconnect. The D-Bus client exposes the ID, and each SMS window filters contact and photo signals to its selected phone. New `contacts_cache_v2.json` and `contact_photos_cache_v2.json` files prevent possibly mixed legacy caches from being read; the legacy files remain on disk, and each phone must sync contacts again to populate its new cache. A two-device core test verifies contact and photo event identity. That test also exposed and prompted a fix for padded base64 photos being mistaken for quoted-printable continuation. `cargo test --workspace --locked --offline` passed 47 tests, with one compositor-dependent test ignored; `cargo check --workspace --locked --offline` passed. The changed D-Bus signal contract requires the service and SMS windows to restart together. Live two-phone behavior remains unverified.
+
+4. ✅ **[P1] Replying to a displayed group sent to only one participant.** The applet now uses every distinct address in the displayed conversation roster, carries the list through Varlink/D-Bus, and puts all recipients in one `kdeconnect.sms.request` packet. Android excludes the phone owner's address from its message roster and expects the desktop to supply the targets; the send packet has no thread ID from which Android could recover them. The applet disables sending when a roster is empty or contains an unusable RCS/group token, rather than silently addressing one member. Tests verify recipient selection and the two-recipient packet; offline workspace tests passed 51 tests (one compositor-dependent test ignored), and `cargo check --workspace --locked --offline` passed. The changed IPC signature requires restarting the service and SMS window together. Actual group MMS/SMS delivery and RCS behavior still require a phone test.
+
+5. ✅ **[P2] The SMS cache stored only the last response packet.** The service now merges incoming batches with the per-device cache by `(thread_id, message_id)` before updating memory and disk. New messages retain other threads; repeated message IDs replace older copies so read-state and message changes remain current. A cache miss loads the prior disk snapshot before merging, while the live D-Bus signal still carries only the new batch. Tests cover partial updates across threads, repeated IDs, and identical IDs in different threads. `cargo test --workspace --locked --offline` passed 53 tests with one compositor-dependent test ignored; `cargo check --workspace --locked --offline` passed. Previously overwritten history cannot be recovered from the old cache; the phone must resync it. Live reconnect/offline behavior remains unverified.
+
+6. ✅ **[P2] A malformed file share left a permanently "receiving" transfer.** A file share missing payload transfer information now reports a terminal `Failed` status with stage `metadata` through the same transfer reporter that emitted `Receiving`. A regression test verifies the receiving-to-failed sequence and that no additional status follows. `cargo test --workspace --locked --offline` passed 56 tests with one compositor-dependent test ignored; `cargo check --workspace --locked --offline` passed. Live malformed-share behavior remains unverified.
+
+7. ✅ **[P2] Payload-size enforcement happened too late to prevent disk exhaustion.** The receive loop now rejects the first read that would exceed the announced size before writing that chunk, and payload reception rejects a missing announced size before connecting. A clean EOF still must match the expected size. Tests verify over-limit rejection without waiting for EOF or writing past the limit, exact-size reception, and rejection of absent size metadata. `cargo test --workspace --locked --offline` passed 56 tests with one compositor-dependent test ignored; `cargo check --workspace --locked --offline` passed. Payloads without a size are now refused, including from older/nonconforming peers; live phone behavior remains unverified.
+
+8. ✅ **[P2] Partial SMS updates could erase the accumulated group roster.** While fixing item 4, conversation updates were changed to retain known addresses and accept a new preview only when its timestamp is at least as recent. The message-batch path likewise no longer overwrites a newer preview with an older message. This prevents a partial response from shrinking the group recipient list. A regression test covers roster and preview preservation; offline workspace tests and check passed. Live phone behavior remains unverified.
+
+**Initial review verification:** `cargo test --workspace --locked --offline` passed 41 tests, with one Wayland-dependent test ignored. The loopback-network test required execution outside the sandbox. `cargo check --workspace --locked --offline` also passed. The findings were based on source-path review; passing existing tests did not validate the uncovered cases or live-device behavior. Verification of the item 1 fix is recorded in that item.
+
+
+I’d test in this order:
+1. If the phone no longer appears paired, re-pair it once—the certificate-pinning change requires this for older pairing records.
+2. Send a short message from a two-recipient group in the desktop SMS window and confirm both recipients receive it.
+3. Open two SMS threads, then disconnect the phone and restart the SMS window and service. Confirm both threads still appear from the cache.
+4. Share a small known file from phone to desktop. Confirm the saved file is complete, the transfer reaches Completed, and no partial file remains after a failed transfer. If you have a second phone, check that its contacts and SMS stay in its own window.
+Watch tail -F ~/.local/share/kdeconnect/service.log during the pass. Ordinary phone sharing checks that transfers still work; the malformed-packet and over-limit cases need a custom sender and are covered by the offline regression tests.
+
+## Upstream Merge - 2026-10-25
+
+✅ Integrated upstream PR #119 (`d038146`, merged as `36a44d9`). KDE Connect uses the TCP initiator as TLS server; the accepted side must act as TLS client and must not send another plaintext identity. Resolved the transport conflict while preserving certificate extraction/pinning, the core acceptance gate, handshake bounds, packet limits, and queue backpressure. The new regression test checks both TLS roles, exact identity framing, both peer certificates, and encrypted traffic in both directions.
+
+✅ Validation with all pre-existing local fixes restored: `cargo test --workspace --locked --offline` passed 57 tests with one compositor-dependent test ignored; `cargo check --workspace --locked --offline` and `git diff --check` passed. The loopback listener test ran outside the sandbox. The merge itself also passed 28 core tests and the workspace check before restoring those fixes.
+
+⏳ Live phone connection/reconnection in both initiation directions remains unverified. No installation, service restart, or push was performed. Existing local changes remain uncommitted, and the pre-merge stash is retained as a backup.
+
+## Repeated Phone Notifications - 2026-10-25
+
+✅ **[P2] Repeated phone packets created repeated desktop popups.** The handler neither tracked notification IDs nor honored `silent`. Inspection of the two available logs found 631 repeated ID/content packets among 699 displayable packets, including a batch repeated about 28 minutes later. Added a registry-owned tracker keyed by authenticated phone ID and notification ID. It suppresses unchanged visible content and silent/legacy sync replies, survives reconnects, and permits changed content and cancelled IDs reused by the phone. Timestamp/icon/action changes alone do not trigger a popup. History holds 4,096 recent IDs for the service lifetime, stores content fingerprints, and resets on restart; identical text under the same active ID is treated as a replay. Display failures are logged and remain retryable. Full notification-body logging was removed.
+
+✅ Six new regression tests cover delayed replay with refreshed metadata, changed content, multiple phones/IDs, silent sync and updates, cancellation/reuse, failed-display retry, incomplete packets, and bounded history. Workspace tests passed 63 tests with one compositor-dependent test ignored; the offline workspace check passed.
+
+⏳ Install/restart and confirm fresh phone messages appear once, reconnect does not replay unchanged messages, and the 30–60 minute repeat no longer occurs. No installation or live notification-daemon validation was performed. Phone cancellation does not yet close a desktop notification; history is not persisted across service restarts.

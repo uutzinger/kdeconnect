@@ -104,22 +104,21 @@ pub async fn request_conversation_messages(device_id: &str, thread_id: &str) {
 
 pub async fn send_sms(
     device_id: &str,
-    phone_number: &str,
+    addresses: &[String],
     message: &str,
     attachments: Vec<String>,
 ) {
     debug!(
-        "send_sms to={} device={} attachments={}",
-        phone_number,
-        device_id,
+        "send_sms device={} recipients={} attachments={}",
+        device_id, addresses.len(),
         attachments.len()
     );
     use kdeconnect_varlink::iface::VarlinkClientInterface;
     let id = device_id.to_string();
-    let phone = phone_number.to_string();
+    let recipients = addresses.to_vec();
     let msg = message.to_string();
     let files = attachments.clone();
-    if via_varlink(|c| async move { c.send_sms(id, phone, msg, files).call().await })
+    if via_varlink(|c| async move { c.send_sms(id, recipients, msg, files).call().await })
         .await
         .is_some()
     {
@@ -130,7 +129,7 @@ pub async fn send_sms(
         return;
     };
     match client
-        .send_sms(device_id, phone_number, message, attachments)
+        .send_sms(device_id, addresses.to_vec(), message, attachments)
         .await
     {
         Ok(_) => debug!("send_sms OK"),

@@ -76,12 +76,14 @@ pub(crate) fn packet_plugin_id(pt: &PacketType) -> Option<&'static str> {
 pub struct PluginRegistry {
     /// device_id.0 → set of disabled plugin IDs
     disabled: Arc<RwLock<HashMap<String, HashSet<String>>>>,
+    notifications: Arc<plugins::notification::NotificationTracker>,
 }
 
 impl PluginRegistry {
     pub fn new() -> Self {
         Self {
             disabled: Arc::new(RwLock::new(HashMap::new())),
+            notifications: Arc::new(plugins::notification::NotificationTracker::default()),
         }
     }
 
@@ -273,11 +275,17 @@ impl PluginRegistry {
                     vcard_count, photos.len(), remote_photo_count
                 );
                 if !contacts.is_empty() {
-                    let _ = connection_tx.send(ConnectionEvent::ContactsReceived(contacts));
+                    let _ = connection_tx.send(ConnectionEvent::ContactsReceived((
+                        device.device_id.clone(),
+                        contacts,
+                    )));
                 }
                 if !photos.is_empty() {
                     debug!("Parsed {} contact photos", photos.len());
-                    let _ = connection_tx.send(ConnectionEvent::ContactPhotosReceived(photos));
+                    let _ = connection_tx.send(ConnectionEvent::ContactPhotosReceived((
+                        device.device_id.clone(),
+                        photos,
+                    )));
                 }
             }
             PacketType::Clipboard => {
@@ -363,11 +371,12 @@ impl PluginRegistry {
             }
             PacketType::Notification => {
                 debug!("Received notification packet");
-                info!("Notification body: {:?}", body);
                 if let Ok(notification) =
                     serde_json::from_value::<plugins::notification::Notification>(body)
                 {
-                    notification.received_packet(&device, core_tx).await;
+                    self.notifications
+                        .received_packet(&device.device_id.0, notification)
+                        .await;
                 }
             }
             PacketType::Ping => {
@@ -376,11 +385,12 @@ impl PluginRegistry {
                 }
             }
             PacketType::RunCommand => {
-                if let Ok(run_command) =
-                    serde_json::from_value::<plugins::run_command::RunCommand>(body)
-                {
-                    run_command.received_packet(&device, core_tx).await;
-                }
+                // This is our outgoing command-list packet. A peer must not
+                // be able to populate the desktop's executable command store.
+                warn!(
+                    "[runcommand] ignoring unsolicited command list from {}",
+                    device.device_id
+                );
             }
             PacketType::RunCommandRequest => {
                 if let Ok(run_command_request) =
@@ -650,8 +660,13 @@ fn unfold_vcard_lines(content: &str) -> Vec<String> {
         if line.starts_with(' ') || line.starts_with('\t') {
             // vCard 3.0/4.0 folded line
             current.push_str(line.trim_start());
-        } else if current.ends_with('=') {
-            // vCard 2.1 QP soft line break
+        } else if current.ends_with('=')
+            && current
+                .split_once(':')
+                .is_some_and(|(property, _)| property.to_ascii_uppercase().contains("ENCODING=QUOTED-PRINTABLE"))
+        {
+            // vCard 2.1 quoted-printable soft line break. Base64 padding
+            // also ends in '=' and must not join the following property.
             current.pop();
             current.push_str(line.trim_start());
         } else {
@@ -779,4 +794,67 @@ fn parse_vcard(content: &str) -> (Option<String>, Vec<String>, VcardPhoto) {
     }
 
     (name, phones, photo)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::device::DeviceId;
+
+    #[test]
+    fn quoted_printable_continuation_does_not_consume_base64_padding() {
+        let vcard = "FN;ENCODING=QUOTED-PRINTABLE:Al=\nice\nPHOTO;ENCODING=BASE64:AA==\nEND:VCARD";
+        let (name, _, photo) = parse_vcard(vcard);
+        assert_eq!(name.as_deref(), Some("Alice"));
+        assert!(matches!(photo, VcardPhoto::Inline(value) if value == "AA=="));
+    }
+
+    #[tokio::test]
+    async fn contact_and_photo_events_keep_the_source_device() {
+        let registry = PluginRegistry::new();
+        let (core_tx, _core_rx) = mpsc::unbounded_channel();
+        let (connection_tx, mut connection_rx) = mpsc::unbounded_channel();
+        let (mpris_tx, _mpris_rx) = mpsc::unbounded_channel();
+
+        for (device_id, name, phone) in [
+            ("phone-a", "Alice", "+15550000001"),
+            ("phone-b", "Bob", "+15550000002"),
+        ] {
+            let device = Device {
+                device_id: DeviceId(device_id.into()),
+                ..Device::default()
+            };
+            let vcard = format!(
+                "BEGIN:VCARD\nFN:{name}\nTEL:{phone}\nPHOTO;ENCODING=BASE64;TYPE=JPEG:AA==\nEND:VCARD"
+            );
+            let packet = ProtocolPacket::new(
+                PacketType::ContactsResponseVcards,
+                serde_json::json!({ "uids": ["contact"], "contact": vcard }),
+            );
+            registry
+                .dispatch(
+                    device,
+                    packet,
+                    core_tx.clone(),
+                    connection_tx.clone(),
+                    mpris_tx.clone(),
+                )
+                .await;
+
+            match connection_rx.recv().await.unwrap() {
+                ConnectionEvent::ContactsReceived((source, contacts)) => {
+                    assert_eq!(source.0, device_id);
+                    assert_eq!(contacts.get(phone).map(String::as_str), Some(name));
+                }
+                _ => panic!("expected contacts event"),
+            }
+            match connection_rx.recv().await.unwrap() {
+                ConnectionEvent::ContactPhotosReceived((source, photos)) => {
+                    assert_eq!(source.0, device_id);
+                    assert_eq!(photos.get(phone).map(String::as_str), Some("AA=="));
+                }
+                _ => panic!("expected contact photos event"),
+            }
+        }
+    }
 }

@@ -10,7 +10,7 @@ use std::{
 use rustls::pki_types::ServerName;
 use socket2::TcpKeepalive;
 use tokio::{
-    io::{AsyncBufReadExt as _, AsyncRead, AsyncReadExt as _, AsyncWrite, AsyncWriteExt, BufReader, split},
+    io::{AsyncBufRead, AsyncBufReadExt as _, AsyncRead, AsyncReadExt as _, AsyncWrite, AsyncWriteExt, BufReader, split},
     net::{TcpListener, TcpStream, UdpSocket},
     sync::{Mutex, Semaphore, mpsc, oneshot},
     time::MissedTickBehavior,
@@ -42,6 +42,7 @@ pub const BROADCAST_ADDR: SocketAddr =
 static CONN_COUNTER: AtomicU64 = AtomicU64::new(0);
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(15);
 static HANDSHAKE_SLOTS: LazyLock<Arc<Semaphore>> = LazyLock::new(|| Arc::new(Semaphore::new(32)));
+const MAX_CONTROL_PACKET_BYTES: usize = 16 * 1024 * 1024;
 
 fn spawn_handshake(future: impl std::future::Future<Output = ()> + Send + 'static) {
     let Ok(permit) = HANDSHAKE_SLOTS.clone().try_acquire_owned() else {
@@ -177,7 +178,7 @@ async fn complete_handshake(
     peer: SocketAddr,
     id: DeviceId,
     name: String,
-    event_tx: mpsc::UnboundedSender<TransportEvent>,
+    event_tx: mpsc::Sender<TransportEvent>,
 ) {
     let mut tls_stream = match establish_control_tls(
         stream,
@@ -232,6 +233,7 @@ async fn complete_handshake(
             write_tx,
             conn_id,
         })
+        .await
         .is_err()
     {
         return;
@@ -261,14 +263,14 @@ fn apply_keepalive(stream: &TcpStream) {
 
 pub struct TcpTransport {
     listen_addr: SocketAddr,
-    event_tx: mpsc::UnboundedSender<TransportEvent>,
+    event_tx: mpsc::Sender<TransportEvent>,
     identity: Arc<Identity>,
     server_config: Arc<rustls::ServerConfig>,
     client_config: Arc<rustls::ClientConfig>,
 }
 
 impl TcpTransport {
-    pub fn new(event_tx: &mpsc::UnboundedSender<TransportEvent>) -> Self {
+    pub fn new(event_tx: &mpsc::Sender<TransportEvent>) -> Self {
         let config = GLOBAL_CONFIG.get().unwrap();
         let listen_addr = config.listen_addr;
         let event_tx = event_tx.clone();
@@ -349,14 +351,14 @@ pub struct UdpTransport {
     socket: Arc<UdpSocket>,
     discovery_interval: Duration,
     #[allow(dead_code)]
-    event_tx: mpsc::UnboundedSender<TransportEvent>,
+    event_tx: mpsc::Sender<TransportEvent>,
     identity: Arc<Identity>,
     server_config: Arc<rustls::ServerConfig>,
     client_config: Arc<rustls::ClientConfig>,
 }
 
 impl UdpTransport {
-    pub async fn new(event_tx: &mpsc::UnboundedSender<TransportEvent>) -> Self {
+    pub async fn new(event_tx: &mpsc::Sender<TransportEvent>) -> Self {
         let config = GLOBAL_CONFIG.get().unwrap();
 
         let socket = {
@@ -513,8 +515,45 @@ impl UdpTransport {
     }
 }
 
+/// Read one newline-framed control packet without allowing an unfinished line
+/// to grow without bound. The limit includes the newline when present.
+async fn read_control_line(
+    reader: &mut (impl AsyncBufRead + Unpin),
+    max_bytes: usize,
+) -> std::io::Result<Option<String>> {
+    let mut raw = Vec::new();
+    loop {
+        let available = reader.fill_buf().await?;
+        if available.is_empty() {
+            return if raw.is_empty() {
+                Ok(None)
+            } else {
+                String::from_utf8(raw).map(Some).map_err(|e| {
+                    std::io::Error::new(std::io::ErrorKind::InvalidData, e)
+                })
+            };
+        }
+
+        let line_end = available.iter().position(|&byte| byte == b'\n');
+        let count = line_end.map_or(available.len(), |position| position + 1);
+        if count > max_bytes.saturating_sub(raw.len()) {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "control packet too long",
+            ));
+        }
+        raw.extend_from_slice(&available[..count]);
+        reader.consume(count);
+        if line_end.is_some() {
+            return String::from_utf8(raw).map(Some).map_err(|e| {
+                std::io::Error::new(std::io::ErrorKind::InvalidData, e)
+            });
+        }
+    }
+}
+
 async fn handle_connection<R, W>(
-    event_tx: mpsc::UnboundedSender<TransportEvent>,
+    event_tx: mpsc::Sender<TransportEvent>,
     reader: R,
     mut writer: W,
     write_rx: Arc<Mutex<mpsc::UnboundedReceiver<ProtocolPacket>>>,
@@ -526,27 +565,26 @@ async fn handle_connection<R, W>(
     W: tokio::io::AsyncWrite + Unpin + Send + 'static,
 {
     let mut reader = BufReader::new(reader);
-    let mut buffer = String::new();
-
     let read = async {
         loop {
-            match reader.read_line(&mut buffer).await {
-                Ok(0) => break,
-                Ok(_) => {
-                    let trimmed = buffer.trim();
-                    if !trimmed.is_empty()
+            match read_control_line(&mut reader, MAX_CONTROL_PACKET_BYTES).await {
+                Ok(None) => break,
+                Ok(Some(buffer)) => {
+                    let raw = buffer.trim().to_string();
+                    drop(buffer);
+                    if !raw.is_empty()
                         && event_tx
                             .send(TransportEvent::IncomingPacket {
                                 addr: peer,
                                 id: id.clone(),
-                                raw: trimmed.to_string(),
+                                raw,
                                 conn_id,
                             })
+                            .await
                             .is_err()
                     {
                         break;
                     }
-                    buffer.clear();
                 }
                 Err(e) => {
                     warn!(?peer, "control read failed: {}", e);
@@ -568,7 +606,7 @@ async fn handle_connection<R, W>(
     // Dropping a superseded writer also ends its reader; no stale connection
     // remains able to deliver packets after a replacement or local disconnect.
     tokio::select! { _ = read => {}, _ = write => {} }
-    let _ = event_tx.send(TransportEvent::Disconnected { id, conn_id });
+    let _ = event_tx.send(TransportEvent::Disconnected { id, conn_id }).await;
 }
 
 /// Build a filtered identity for a specific device, removing capabilities
@@ -685,6 +723,10 @@ pub(crate) async fn receive_payload(
     expected_size: Option<u64>,
     on_progress: Option<&(dyn Fn(u64) + Send + Sync)>,
 ) -> Result<u64, PayloadError> {
+    let expected_size = expected_size.ok_or_else(|| PayloadError {
+        stage: "metadata",
+        source: anyhow::anyhow!("payload size was not announced"),
+    })?;
     let config = GLOBAL_CONFIG.get().unwrap();
     let client_config = config.key_store.client_config.clone();
     debug!("client config created.");
@@ -734,15 +776,16 @@ pub(crate) async fn receive_payload(
         }
     })?;
 
-    let received =
-        copy_with_inactivity_deadline(&mut stream, save_path, PAYLOAD_INACTIVITY_TIMEOUT, on_progress)
-            .await
-            .map_err(|e| PayloadError {
-                stage: "receive",
-                source: e,
-            })?;
+    let received = copy_with_inactivity_deadline(
+        &mut stream,
+        save_path,
+        PAYLOAD_INACTIVITY_TIMEOUT,
+        Some(expected_size),
+        on_progress,
+    )
+    .await?;
 
-    validate_payload_size(expected_size, received).map_err(|e| PayloadError {
+    validate_payload_size(Some(expected_size), received).map_err(|e| PayloadError {
         stage: "size-validation",
         source: e,
     })?;
@@ -771,25 +814,49 @@ async fn copy_with_inactivity_deadline(
     reader: &mut (impl AsyncRead + Unpin),
     writer: &mut (impl AsyncWrite + Unpin),
     deadline: Duration,
+    expected_size: Option<u64>,
     on_progress: Option<&(dyn Fn(u64) + Send + Sync)>,
-) -> anyhow::Result<u64> {
+) -> Result<u64, PayloadError> {
     let mut total = 0u64;
     let mut buf = vec![0u8; 64 * 1024];
     loop {
         let n = match tokio::time::timeout(deadline, reader.read(&mut buf)).await {
-            Ok(res) => res?,
+            Ok(res) => res.map_err(|e| PayloadError {
+                stage: "receive",
+                source: anyhow::Error::new(e).context("reading payload"),
+            })?,
             Err(_) => {
-                anyhow::bail!(
-                    "transfer stalled: no bytes received for {:?} ({} bytes so far)",
-                    deadline,
-                    total
-                )
+                return Err(PayloadError {
+                    stage: "receive",
+                    source: anyhow::anyhow!(
+                        "transfer stalled: no bytes received for {:?} ({} bytes so far)",
+                        deadline,
+                        total
+                    ),
+                });
             }
         };
         if n == 0 {
             return Ok(total);
         }
-        writer.write_all(&buf[..n]).await?;
+        // Reject the first over-limit read before any bytes from it reach
+        // disk. A peer that keeps streaming can no longer fill the drive.
+        if let Some(expected) = expected_size
+            && n as u64 > expected.saturating_sub(total)
+        {
+            return Err(PayloadError {
+                stage: "size-validation",
+                source: anyhow::anyhow!(
+                    "payload size mismatch: announced {} bytes, received at least {}",
+                    expected,
+                    total.saturating_add(n as u64)
+                ),
+            });
+        }
+        writer.write_all(&buf[..n]).await.map_err(|e| PayloadError {
+            stage: "receive",
+            source: anyhow::Error::new(e).context("writing payload"),
+        })?;
         total += n as u64;
         if let Some(cb) = on_progress {
             cb(total);
@@ -976,6 +1043,23 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn payload_without_announced_size_is_rejected_before_connecting() {
+        let temp = tempfile::NamedTempFile::new().unwrap();
+        let mut file = tokio::fs::File::from_std(temp.reopen().unwrap());
+        let error = receive_payload(
+            &Device::default(),
+            &DEFAULT_LISTEN_ADDR,
+            &mut file,
+            None,
+            None,
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(error.stage, "metadata");
+        assert_eq!(temp.path().metadata().unwrap().len(), 0);
+    }
+
+    #[tokio::test]
     async fn copy_loop_reports_progress_and_eof() {
         let (mut sender, mut receiver) = tokio::io::duplex(4096);
         let progress = Arc::new(std::sync::Mutex::new(Vec::new()));
@@ -993,6 +1077,7 @@ mod tests {
             &mut receiver,
             &mut sink,
             Duration::from_secs(5),
+            Some(19),
             Some(&cb),
         )
         .await
@@ -1009,6 +1094,32 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn copy_loop_rejects_excess_before_writing_it_or_waiting_for_eof() {
+        let (mut sender, mut receiver) = tokio::io::duplex(4096);
+        sender.write_all(b"12345").await.unwrap();
+        // Keep the sender open. Excess data must fail immediately, without
+        // waiting for EOF or the inactivity deadline.
+        let temp = tempfile::NamedTempFile::new().unwrap();
+        let mut file = tokio::fs::File::from_std(temp.reopen().unwrap());
+        let error = tokio::time::timeout(
+            Duration::from_secs(1),
+            copy_with_inactivity_deadline(
+                &mut receiver,
+                &mut file,
+                Duration::from_secs(5),
+                Some(4),
+                None,
+            ),
+        )
+        .await
+        .unwrap()
+        .unwrap_err();
+        assert_eq!(error.stage, "size-validation");
+        file.flush().await.unwrap();
+        assert!(temp.path().metadata().unwrap().len() <= 4);
+    }
+
+    #[tokio::test]
     async fn copy_loop_fails_when_transfer_stalls() {
         let (sender, mut receiver) = tokio::io::duplex(4096);
         // Keep the writer open but silent: the read must hit the inactivity
@@ -1020,6 +1131,7 @@ mod tests {
             &mut receiver,
             &mut sink,
             Duration::from_millis(50),
+            None,
             None,
         )
         .await
@@ -1044,6 +1156,7 @@ mod tests {
             &mut receiver,
             &mut sink,
             Duration::from_millis(200),
+            None,
             None,
         )
         .await
@@ -1085,10 +1198,59 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn control_reader_preserves_packet_boundaries_and_eof() {
+        let mut reader = BufReader::new(b"first\nsecond\nlast".as_slice());
+        assert_eq!(read_control_line(&mut reader, 8).await.unwrap().as_deref(), Some("first\n"));
+        assert_eq!(read_control_line(&mut reader, 8).await.unwrap().as_deref(), Some("second\n"));
+        assert_eq!(read_control_line(&mut reader, 8).await.unwrap().as_deref(), Some("last"));
+        assert!(read_control_line(&mut reader, 8).await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn control_reader_rejects_unterminated_packet_above_limit() {
+        let (mut sender, receiver) = tokio::io::duplex(32);
+        let mut reader = BufReader::new(receiver);
+        sender.write_all(b"123456789").await.unwrap();
+        let error = tokio::time::timeout(Duration::from_secs(1), read_control_line(&mut reader, 8))
+            .await
+            .unwrap()
+            .unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
+        assert!(error.to_string().contains("too long"));
+    }
+
+    #[tokio::test]
+    async fn control_packets_wait_for_queue_capacity() {
+        let (tx, mut rx) = mpsc::channel(1);
+        let (writer_tx, writer_rx) = mpsc::unbounded_channel();
+        let (mut peer, stream) = tokio::io::duplex(32);
+        let (reader, writer) = split(stream);
+        let task = tokio::spawn(handle_connection(
+            tx,
+            reader,
+            writer,
+            Arc::new(Mutex::new(writer_rx)),
+            "127.0.0.1:1716".parse().unwrap(),
+            DeviceId("phone".into()),
+            43,
+        ));
+        peer.write_all(b"first\nsecond\n").await.unwrap();
+        for expected in ["first", "second"] {
+            let event = tokio::time::timeout(Duration::from_secs(1), rx.recv())
+                .await
+                .unwrap()
+                .unwrap();
+            assert!(matches!(event, TransportEvent::IncomingPacket { raw, .. } if raw == expected));
+        }
+        drop(writer_tx);
+        tokio::time::timeout(Duration::from_secs(1), task).await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
     async fn silent_client_does_not_block_next_connection() {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
-        let (tx, _rx) = mpsc::unbounded_channel();
+        let (tx, _rx) = mpsc::channel(16);
         let transport = TcpTransport {
             listen_addr: addr,
             event_tx: tx,
@@ -1118,7 +1280,7 @@ mod tests {
 
     #[tokio::test]
     async fn closing_writer_ends_reader_and_reports_connection_id() {
-        let (tx, mut rx) = mpsc::unbounded_channel();
+        let (tx, mut rx) = mpsc::channel(16);
         let (writer_tx, writer_rx) = mpsc::unbounded_channel();
         let (_peer, stream) = tokio::io::duplex(1024);
         let (reader, writer) = split(stream);

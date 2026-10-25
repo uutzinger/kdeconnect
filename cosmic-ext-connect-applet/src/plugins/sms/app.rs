@@ -410,7 +410,8 @@ impl Application for SmsWindow {
                                         ProtocolEvent::ConversationsReceived(conversations)
                                     );
                                 }
-                                ServiceEvent::ContactsReceived(contacts) => {
+                                ServiceEvent::ContactsReceived(event_device_id, contacts)
+                                    if event_device_id == device_id => {
                                     debug!("ContactsReceived {} entries", contacts.len());
                                     yield SmsMessage::ContactsLoaded(contacts);
                                 }
@@ -421,7 +422,8 @@ impl Application for SmsWindow {
                                 }
                                 ServiceEvent::SmsMessagesReceived(_, _)
                                 | ServiceEvent::SmsAttachmentReceived(_, _, _) => {}
-                                ServiceEvent::ContactPhotosReceived(photos) => {
+                                ServiceEvent::ContactPhotosReceived(event_device_id, photos)
+                                    if event_device_id == device_id => {
                                     debug!("ContactPhotosReceived {} entries", photos.len());
                                     let decoded: HashMap<String, Vec<u8>> = photos
                                         .into_iter()
@@ -647,7 +649,11 @@ impl Application for SmsWindow {
                 };
 
                 let device_id = self.device_id.clone();
-                let phone = conv.phone_number.clone();
+                let Some(addresses) = conv.send_addresses() else {
+                    warn!("Cannot send SMS: conversation has an unusable recipient list");
+                    return Task::none();
+                };
+                let phone = addresses[0].clone();
                 let text = self.message_input.clone();
                 let attachments = std::mem::take(&mut self.pending_attachments);
                 let now = utils::now_millis();
@@ -710,7 +716,7 @@ impl Application for SmsWindow {
                 return Task::batch(vec![
                     scroll_task.map(|_: cosmic::widget::Id| Action::App(SmsMessage::RefreshThread)),
                     cosmic::task::future(async move {
-                        dbus::send_sms(&device_id, &phone, &text, attachments).await;
+                        dbus::send_sms(&device_id, &addresses, &text, attachments).await;
                         Action::App(SmsMessage::RefreshThread)
                     }),
                 ]);
@@ -873,7 +879,7 @@ impl SmsWindow {
                         .iter_mut()
                         .find(|c| c.thread_id == incoming.thread_id)
                     {
-                        *existing = incoming.clone();
+                        existing.merge_partial_update(incoming);
                     } else {
                         merged.push(incoming.clone());
                     }
@@ -941,8 +947,10 @@ impl SmsWindow {
                 .iter_mut()
                 .find(|c| c.thread_id == message.thread_id)
             {
-                conv.last_message = message.body.clone();
-                conv.timestamp = message.date;
+                if message.date >= conv.timestamp {
+                    conv.last_message = message.body.clone();
+                    conv.timestamp = message.date;
+                }
                 if !selected_now && message.type_ != 2 {
                     conv.unread = true;
                 }

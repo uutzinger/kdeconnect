@@ -35,7 +35,7 @@ method RejectPairing(device_id: string) -> ()
 
 method RequestConversations(device_id: string) -> ()
 method RequestConversation(device_id: string, thread_id: int) -> ()
-method SendSms(device_id: string, phone_number: string, message: string, attachments: []string) -> ()
+method SendSms(device_id: string, addresses: []string, message: string, attachments: []string) -> ()
 method GetCachedSms(device_id: string) -> (json: string)
 method RequestContacts(device_id: string) -> ()
 method GetCachedContacts(device_id: string) -> (json: string)

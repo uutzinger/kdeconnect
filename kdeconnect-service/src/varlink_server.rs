@@ -261,10 +261,14 @@ impl VarlinkInterface for KdeConnectVarlinkService {
 
     async fn send_sms(
         &self, call: &mut dyn Call_SendSms,
-        device_id: String, phone_number: String, message: String, attachments: Vec<String>,
+        device_id: String, addresses: Vec<String>, message: String, attachments: Vec<String>,
     ) -> varlink::Result<()> {
+        if addresses.is_empty() || addresses.iter().any(|address| address.trim().is_empty()) {
+            tracing::warn!("Varlink SendSms ignored: recipient list is empty or contains a blank address");
+            return call.reply();
+        }
         let packet =
-            kdeconnect_core::plugins::sms::build_send_packet(&phone_number, &message, &attachments)
+            kdeconnect_core::plugins::sms::build_send_packet(&addresses, &message, &attachments)
                 .await;
         let _ = self.event_sender.send(AppEvent::SendPacket(DeviceId(device_id), packet));
         call.reply()

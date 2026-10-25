@@ -5,6 +5,7 @@ use kdeconnect_core::{
     KdeConnectCore, PacketType, ProtocolPacket,
     device::{DeviceId, DeviceState, PairState},
     event::{AppEvent, ConnectionEvent},
+    plugins::sms::SmsMessages,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::json;
@@ -21,6 +22,10 @@ const SERVICE_NAME: &str = "io.github.hepp3n.kdeconnect";
 const DAEMON_PATH: &str = "/io/github/hepp3n/kdeconnect/Daemon";
 const SMS_PATH: &str = "/io/github/hepp3n/kdeconnect/Sms";
 const CONTACTS_PATH: &str = "/io/github/hepp3n/kdeconnect/Contacts";
+// Legacy files may contain another phone's contacts because their writes used
+// the last connected device. Ignore them and rebuild trusted per-device caches.
+const CONTACTS_CACHE_FILE: &str = "contacts_cache_v2.json";
+const CONTACT_PHOTOS_CACHE_FILE: &str = "contact_photos_cache_v2.json";
 
 pub(crate) type SmsCache = Arc<Mutex<HashMap<String, Arc<str>>>>;
 
@@ -64,6 +69,45 @@ async fn cache_sms(cache: &SmsCache, device_id: &str, messages_json: &str) {
         .insert(device_id.to_owned(), Arc::from(messages_json));
 }
 
+/// A phone sends conversation summaries, individual updates, and full thread
+/// responses as separate packets. Retain messages from earlier packets while
+/// replacing a repeated (thread, message) pair with its latest version.
+fn merge_sms_cache(
+    previous_json: Option<&str>,
+    incoming: &SmsMessages,
+) -> serde_json::Result<String> {
+    let previous: Option<SmsMessages> = previous_json.and_then(|json| {
+        match serde_json::from_str(json) {
+            Ok(previous) => Some(previous),
+            Err(e) => {
+                warn!("Ignoring malformed existing SMS cache: {}", e);
+                None
+            }
+        }
+    });
+    let mut positions = HashMap::new();
+    let mut messages = Vec::new();
+    for message in previous
+        .iter()
+        .flat_map(|batch| batch.messages.iter())
+        .chain(incoming.messages.iter())
+    {
+        let key = (message.thread_id, message.id);
+        if let Some(&index) = positions.get(&key) {
+            messages[index] = message.clone();
+        } else {
+            positions.insert(key, messages.len());
+            messages.push(message.clone());
+        }
+    }
+    serde_json::to_string(&SmsMessages {
+        messages,
+        version: incoming
+            .version
+            .or_else(|| previous.as_ref().and_then(|batch| batch.version)),
+    })
+}
+
 /// Simplified device info for D-Bus
 #[derive(
     Debug,
@@ -90,7 +134,7 @@ fn device_cache_dir(device_id: &str) -> std::path::PathBuf {
 }
 
 async fn save_contacts_cache(device_id: &str, contacts: &HashMap<String, String>) {
-    let path = device_cache_dir(device_id).join("contacts_cache.json");
+    let path = device_cache_dir(device_id).join(CONTACTS_CACHE_FILE);
     if let Some(parent) = path.parent() {
         let _ = tokio::fs::create_dir_all(parent).await;
     }
@@ -111,7 +155,7 @@ async fn save_contacts_cache(device_id: &str, contacts: &HashMap<String, String>
 }
 
 pub(crate) async fn load_contacts_cache(device_id: &str) -> Option<HashMap<String, String>> {
-    let path = device_cache_dir(device_id).join("contacts_cache.json");
+    let path = device_cache_dir(device_id).join(CONTACTS_CACHE_FILE);
     match tokio::fs::read_to_string(&path).await {
         Ok(json) => match serde_json::from_str(&json) {
             Ok(map) => {
@@ -137,7 +181,7 @@ pub(crate) async fn load_contacts_cache(device_id: &str) -> Option<HashMap<Strin
 /// the UI (these stay base64 the whole way through, same as SMS
 /// thumbnails — see `ConnectionEvent::ContactPhotosReceived`).
 async fn save_contact_photos_cache(device_id: &str, photos: &HashMap<String, String>) {
-    let path = device_cache_dir(device_id).join("contact_photos_cache.json");
+    let path = device_cache_dir(device_id).join(CONTACT_PHOTOS_CACHE_FILE);
     if let Some(parent) = path.parent() {
         let _ = tokio::fs::create_dir_all(parent).await;
     }
@@ -158,7 +202,7 @@ async fn save_contact_photos_cache(device_id: &str, photos: &HashMap<String, Str
 }
 
 pub(crate) async fn load_contact_photos_cache(device_id: &str) -> Option<HashMap<String, String>> {
-    let path = device_cache_dir(device_id).join("contact_photos_cache.json");
+    let path = device_cache_dir(device_id).join(CONTACT_PHOTOS_CACHE_FILE);
     match tokio::fs::read_to_string(&path).await {
         Ok(json) => match serde_json::from_str(&json) {
             Ok(map) => Some(map),
@@ -725,16 +769,19 @@ impl SmsInterface {
     async fn send_sms(
         &self,
         device_id: String,
-        phone_number: String,
+        addresses: Vec<String>,
         message: String,
         attachments: Vec<String>,
     ) -> zbus::fdo::Result<()> {
         info!(
-            "D-Bus: SendSms called for {} to {} ({} attachment(s))",
-            device_id, phone_number, attachments.len()
+            "D-Bus: SendSms called for {} ({} recipient(s), {} attachment(s))",
+            device_id, addresses.len(), attachments.len()
         );
+        if addresses.is_empty() || addresses.iter().any(|address| address.trim().is_empty()) {
+            return Err(zbus::fdo::Error::InvalidArgs("SMS recipients must be nonempty".into()));
+        }
         let packet = kdeconnect_core::plugins::sms::build_send_packet(
-            &phone_number,
+            &addresses,
             &message,
             &attachments,
         )
@@ -833,6 +880,7 @@ impl ContactsInterface {
     #[zbus(signal)]
     async fn contacts_received(
         signal_emitter: &SignalEmitter<'_>,
+        device_id: String,
         contacts_json: String,
     ) -> zbus::Result<()>;
 
@@ -841,6 +889,7 @@ impl ContactsInterface {
     #[zbus(signal)]
     async fn contact_photos_received(
         signal_emitter: &SignalEmitter<'_>,
+        device_id: String,
         photos_json: String,
     ) -> zbus::Result<()>;
 }
@@ -925,8 +974,12 @@ impl KdeConnectService {
 
 #[cfg(test)]
 mod tests {
-    use super::{MAX_RECENT_TRANSFERS, SmsCache, cache_sms, cached_sms, record_transfer_status};
+    use super::{
+        MAX_RECENT_TRANSFERS, SmsCache, cache_sms, cached_sms, merge_sms_cache,
+        record_transfer_status,
+    };
     use kdeconnect_core::event::{TransferDirection, TransferState, TransferStatus};
+    use kdeconnect_core::plugins::sms::SmsMessages;
     use std::{collections::HashMap, sync::Arc};
     use tokio::sync::Mutex;
 
@@ -939,6 +992,52 @@ mod tests {
         assert!(cached_sms(&cache, "missing").await.is_none());
         assert!(cached_sms(&cache, "phone-a").await.unwrap().contains("\"_id\":1"));
         assert!(cached_sms(&cache, "phone-b").await.unwrap().contains("\"_id\":2"));
+    }
+
+    #[test]
+    fn sms_cache_merges_partial_batches_and_updates_existing_messages() {
+        let first: SmsMessages = serde_json::from_str(r#"{"version":2,"messages":[
+            {"_id":1,"thread_id":10,"date":100,"type":1,"read":0,"body":"first"},
+            {"_id":2,"thread_id":20,"date":200,"type":1,"read":0,"body":"other thread"}
+        ]}"#).unwrap();
+        let one_new: SmsMessages = serde_json::from_str(r#"{"version":2,"messages":[
+            {"_id":3,"thread_id":10,"date":300,"type":1,"read":0,"body":"new"}
+        ]}"#).unwrap();
+        let merged_json =
+            merge_sms_cache(Some(&serde_json::to_string(&first).unwrap()), &one_new).unwrap();
+        let merged: SmsMessages = serde_json::from_str(&merged_json).unwrap();
+        assert_eq!(merged.messages.len(), 3);
+        assert!(merged.messages.iter().any(|m| m.thread_id == 20 && m.id == 2));
+
+        let changed: SmsMessages = serde_json::from_str(r#"{"version":2,"messages":[
+            {"_id":1,"thread_id":10,"date":100,"type":1,"read":1,"body":"first"}
+        ]}"#).unwrap();
+        let updated: SmsMessages =
+            serde_json::from_str(&merge_sms_cache(Some(&merged_json), &changed).unwrap()).unwrap();
+        assert_eq!(updated.messages.len(), 3);
+        assert_eq!(
+            updated
+                .messages
+                .iter()
+                .find(|m| m.thread_id == 10 && m.id == 1)
+                .unwrap()
+                .read,
+            1
+        );
+    }
+
+    #[test]
+    fn sms_cache_uses_thread_and_message_id_together() {
+        let first: SmsMessages = serde_json::from_str(r#"{"messages":[
+            {"_id":1,"thread_id":10,"date":100},
+            {"_id":1,"thread_id":20,"date":200}
+        ]}"#).unwrap();
+        let empty: SmsMessages = serde_json::from_str(r#"{"messages":[]}"#).unwrap();
+        let merged: SmsMessages = serde_json::from_str(
+            &merge_sms_cache(Some(&serde_json::to_string(&first).unwrap()), &empty).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(merged.messages.len(), 2);
     }
 
     fn transfer(id: &str, bytes: u64) -> TransferStatus {
@@ -1242,6 +1341,7 @@ impl KdeConnectService {
                                 .await?;
                             ContactsInterface::contacts_received(
                                 iface_ref.signal_emitter(),
+                                did.clone(),
                                 contacts_json,
                             )
                             .await?;
@@ -1435,8 +1535,13 @@ impl KdeConnectService {
                 let messages_json = serde_json::to_string(&sms_data)?;
                 debug!("SMS JSON size: {} bytes", messages_json.len());
 
-                cache_sms(sms_cache, &device_id.0, &messages_json).await;
-                save_sms_cache(&device_id.0, &messages_json).await;
+                let previous = match cached_sms(sms_cache, &device_id.0).await {
+                    Some(json) => Some(json),
+                    None => load_sms_cache(&device_id.0).await.map(Arc::from),
+                };
+                let merged_json = merge_sms_cache(previous.as_deref(), &sms_data)?;
+                cache_sms(sms_cache, &device_id.0, &merged_json).await;
+                save_sms_cache(&device_id.0, &merged_json).await;
 
                 let iface_ref = connection
                     .object_server()
@@ -1451,12 +1556,10 @@ impl KdeConnectService {
                 .await?;
                 debug!("SMS D-Bus signal emitted");
             }
-            ConnectionEvent::ContactsReceived(contacts) => {
-                info!("Contacts received: {} entries", contacts.len());
+            ConnectionEvent::ContactsReceived((device_id, contacts)) => {
+                info!("Contacts received: {} entries from {}", contacts.len(), device_id);
 
-                if let Some(did) = current_device_id.lock().await.as_deref() {
-                    save_contacts_cache(did, &contacts).await;
-                }
+                save_contacts_cache(&device_id.0, &contacts).await;
 
                 let contacts_json = serde_json::to_string(&contacts)?;
 
@@ -1465,16 +1568,18 @@ impl KdeConnectService {
                     .interface::<_, ContactsInterface>(CONTACTS_PATH)
                     .await?;
 
-                ContactsInterface::contacts_received(iface_ref.signal_emitter(), contacts_json)
+                ContactsInterface::contacts_received(
+                    iface_ref.signal_emitter(),
+                    device_id.0,
+                    contacts_json,
+                )
                     .await?;
                 debug!("Contacts D-Bus signal emitted");
             }
-            ConnectionEvent::ContactPhotosReceived(photos) => {
-                info!("Contact photos received: {} entries", photos.len());
+            ConnectionEvent::ContactPhotosReceived((device_id, photos)) => {
+                info!("Contact photos received: {} entries from {}", photos.len(), device_id);
 
-                if let Some(did) = current_device_id.lock().await.as_deref() {
-                    save_contact_photos_cache(did, &photos).await;
-                }
+                save_contact_photos_cache(&device_id.0, &photos).await;
 
                 let photos_json = serde_json::to_string(&photos)?;
 
@@ -1483,7 +1588,11 @@ impl KdeConnectService {
                     .interface::<_, ContactsInterface>(CONTACTS_PATH)
                     .await?;
 
-                ContactsInterface::contact_photos_received(iface_ref.signal_emitter(), photos_json)
+                ContactsInterface::contact_photos_received(
+                    iface_ref.signal_emitter(),
+                    device_id.0,
+                    photos_json,
+                )
                     .await?;
                 debug!("ContactPhotosReceived D-Bus signal emitted");
             }

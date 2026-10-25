@@ -68,12 +68,7 @@ impl ShareRequest {
     ) -> anyhow::Result<()> {
         match self {
             ShareRequest::File(f) => {
-                let info = info.ok_or_else(|| {
-                    anyhow::anyhow!(
-                        "[share] file share '{}' missing payload transfer info",
-                        f.filename
-                    )
-                })?;
+                let (info, transfer) = file_payload_info(&f.filename, info, transfer)?;
                 self.handle_file_request(f, device, info, expected_size, transfer)
                     .await
             }
@@ -217,6 +212,47 @@ impl ShareRequest {
             .map_err(|e| ("publish", e.context("publishing file to Downloads")))?;
 
         Ok((dest, received))
+    }
+}
+
+/// Metadata errors happen before `handle_file_request`, so its failure
+/// reporter cannot see them. End the already-started transfer here.
+fn file_payload_info<'a>(
+    filename: &str,
+    info: Option<&'a PacketPayloadTransferInfo>,
+    transfer: Option<crate::filetransfer::IncomingTransfer>,
+) -> anyhow::Result<(&'a PacketPayloadTransferInfo, Option<crate::filetransfer::IncomingTransfer>)> {
+    match info {
+        Some(info) => Ok((info, transfer)),
+        None => {
+            let error = anyhow::anyhow!(
+                "[share] file share '{}' missing payload transfer info",
+                filename
+            );
+            if let Some(transfer) = transfer {
+                transfer.failed("metadata", error.to_string());
+            }
+            Err(error)
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::file_payload_info;
+    use crate::{device::DeviceId, event::{ConnectionEvent, TransferState}, filetransfer::IncomingTransfer};
+
+    #[tokio::test]
+    async fn missing_file_payload_metadata_emits_terminal_failure() {
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let transfer = IncomingTransfer::new(tx, &DeviceId("phone-a".into()), Some("file.txt".into()), Some(10));
+        transfer.started();
+        assert!(file_payload_info("file.txt", None, Some(transfer)).is_err());
+        let first = rx.recv().await.unwrap();
+        let second = rx.recv().await.unwrap();
+        assert!(matches!(first, ConnectionEvent::TransferStatus(status) if status.state == TransferState::Receiving));
+        assert!(matches!(second, ConnectionEvent::TransferStatus(status) if matches!(&status.state, TransferState::Failed { stage, .. } if stage == "metadata")));
+        assert!(rx.try_recv().is_err());
     }
 }
 

@@ -177,7 +177,7 @@ impl SmsAttachmentFile {
 }
 
 /// Per-device cache directory for downloaded MMS attachments — a sibling
-/// of the existing `sms_cache.json`/`contacts_cache.json` directory.
+/// of the existing SMS and contacts cache files.
 pub fn attachments_dir(device_id: &str) -> std::path::PathBuf {
     let base = dirs::data_local_dir().unwrap_or_else(|| std::path::PathBuf::from("/tmp"));
     base.join(crate::config::CONFIG_DIR)
@@ -255,7 +255,7 @@ pub fn guess_mime_type(path: &std::path::Path) -> String {
 /// Attachments that fail to read are skipped (logged), not fatal — the
 /// rest of the message still sends.
 pub async fn build_send_packet(
-    phone_number: &str,
+    addresses: &[String],
     message: &str,
     attachment_paths: &[String],
 ) -> crate::protocol::ProtocolPacket {
@@ -269,7 +269,7 @@ pub async fn build_send_packet(
 
     let mut body = serde_json::json!({
         "sendSms": true,
-        "addresses": [{ "address": phone_number }],
+        "addresses": addresses.iter().map(|address| serde_json::json!({ "address": address })).collect::<Vec<_>>(),
         "messageBody": message,
         "version": 2,
     });
@@ -279,6 +279,21 @@ pub async fn build_send_packet(
     }
 
     crate::protocol::ProtocolPacket::new(crate::protocol::PacketType::SmsRequest, body)
+}
+
+#[cfg(test)]
+mod send_tests {
+    use super::build_send_packet;
+
+    #[tokio::test]
+    async fn outgoing_packet_contains_all_group_recipients() {
+        let addresses = vec!["+15551110001".to_string(), "+15551110002".to_string()];
+        let packet = build_send_packet(&addresses, "hello group", &[]).await;
+        assert_eq!(packet.body["addresses"], serde_json::json!([
+            {"address": "+15551110001"}, {"address": "+15551110002"}
+        ]));
+        assert_eq!(packet.body["messageBody"], "hello group");
+    }
 }
 
 /// True if any conversation in `messages_json` has a message newer than

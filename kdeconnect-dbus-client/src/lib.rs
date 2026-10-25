@@ -32,7 +32,7 @@ pub enum ServiceEvent {
     DevicePaired(String, Device),
     DeviceDisconnected(String),
     SmsMessagesReceived(String, String),       // device_id, JSON string
-    ContactsReceived(HashMap<String, String>), // phone -> name
+    ContactsReceived(String, HashMap<String, String>), // device_id, phone -> name
     PairingRequested(String, String),          // device_id, device_name
     ClipboardReceived(String),                 // clipboard content from phone
     BatteryReceived(String, i32, bool),        // device_id, level, is_charging
@@ -43,7 +43,7 @@ pub enum ServiceEvent {
     /// (filename/unique_identifier, local file path)
     SmsAttachmentReceived(String, String, String), // device_id, filename, path
     /// Phone -> base64-encoded photo
-    ContactPhotosReceived(HashMap<String, String>),
+    ContactPhotosReceived(String, HashMap<String, String>), // device_id, phone -> base64 photo
     /// Structured transfer status (device_id, status_json) — a serialized
     /// `kdeconnect_core::event::TransferStatus`.
     TransferStatusReceived(String, String),
@@ -145,7 +145,7 @@ trait Sms {
     async fn send_sms(
         &self,
         device_id: &str,
-        phone_number: &str,
+        addresses: Vec<String>,
         message: &str,
         attachments: Vec<String>,
     ) -> zbus::Result<()>;
@@ -190,10 +190,10 @@ trait Contacts {
     async fn get_cached_contact_photos(&self, device_id: &str) -> zbus::Result<String>;
 
     #[zbus(signal)]
-    async fn contacts_received(&self, contacts_json: String) -> zbus::Result<()>;
+    async fn contacts_received(&self, device_id: String, contacts_json: String) -> zbus::Result<()>;
 
     #[zbus(signal)]
-    async fn contact_photos_received(&self, photos_json: String) -> zbus::Result<()>;
+    async fn contact_photos_received(&self, device_id: String, photos_json: String) -> zbus::Result<()>;
 }
 
 /// Main client for KDE Connect service
@@ -338,13 +338,13 @@ impl KdeConnectClient {
     pub async fn send_sms(
         &self,
         device_id: &str,
-        phone_number: &str,
+        addresses: Vec<String>,
         message: &str,
         attachments: Vec<String>,
     ) -> Result<()> {
         Ok(self
             .sms_proxy
-            .send_sms(device_id, phone_number, message, attachments)
+            .send_sms(device_id, addresses, message, attachments)
             .await?)
     }
 
@@ -469,7 +469,7 @@ impl KdeConnectClient {
                     Ok(args) => {
                         let map: HashMap<String, String> =
                             serde_json::from_str(&args.contacts_json).unwrap_or_default();
-                        Some(ServiceEvent::ContactsReceived(map))
+                        Some(ServiceEvent::ContactsReceived(args.device_id.clone(), map))
                     }
                     Err(e) => {
                         error!("Failed to parse ContactsReceived signal: {:?}", e);
@@ -622,7 +622,7 @@ impl KdeConnectClient {
                     Ok(args) => {
                         let map: HashMap<String, String> =
                             serde_json::from_str(&args.photos_json).unwrap_or_default();
-                        Some(ServiceEvent::ContactPhotosReceived(map))
+                        Some(ServiceEvent::ContactPhotosReceived(args.device_id.clone(), map))
                     }
                     Err(e) => {
                         error!("Failed to parse ContactPhotosReceived signal: {:?}", e);

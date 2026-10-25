@@ -33,6 +33,78 @@ impl Conversation {
             self.contact_name.clone()
         }
     }
+
+    /// Android excludes the device's own address from each SMS message's
+    /// address list. Do not silently send a displayed group to a subset when
+    /// an RCS token or empty address makes its roster unusable.
+    pub fn send_addresses(&self) -> Option<Vec<String>> {
+        let mut recipients = Vec::new();
+        for address in &self.addresses {
+            let address = address.trim();
+            let looks_like_phone = address.chars().any(|c| c.is_ascii_digit())
+                && address.chars().all(|c| c.is_ascii_digit() || matches!(c, '+' | '-' | '.' | '(' | ')' | ' '));
+            if address.is_empty() || !(address.contains('@') || looks_like_phone) {
+                return None;
+            }
+            if !recipients.iter().any(|existing| existing == address) {
+                recipients.push(address.to_string());
+            }
+        }
+        if recipients.is_empty() { None } else { Some(recipients) }
+    }
+
+    pub fn merge_partial_update(&mut self, incoming: &Conversation) {
+        for address in &incoming.addresses {
+            if !self.addresses.contains(address) {
+                self.addresses.push(address.clone());
+            }
+        }
+        if incoming.timestamp >= self.timestamp {
+            self.phone_number = incoming.phone_number.clone();
+            self.last_message = incoming.last_message.clone();
+            self.timestamp = incoming.timestamp;
+        }
+        self.unread |= incoming.unread;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::Conversation;
+
+    fn conversation(addresses: &[&str]) -> Conversation {
+        Conversation {
+            thread_id: "1".into(), contact_name: String::new(),
+            phone_number: String::new(), addresses: addresses.iter().map(|s| s.to_string()).collect(),
+            last_message: String::new(), timestamp: 0, unread: false,
+        }
+    }
+
+    #[test]
+    fn group_send_uses_every_distinct_recipient() {
+        assert_eq!(conversation(&["+1 555 111 0001", "+1 555 111 0002", "+1 555 111 0001"]).send_addresses(),
+            Some(vec!["+1 555 111 0001".into(), "+1 555 111 0002".into()]));
+    }
+
+    #[test]
+    fn group_send_rejects_unusable_roster() {
+        assert_eq!(conversation(&["+15551110001", "rcs-group-123"]).send_addresses(), None);
+        assert_eq!(conversation(&[]).send_addresses(), None);
+    }
+
+    #[test]
+    fn partial_update_preserves_group_and_newest_preview() {
+        let mut existing = conversation(&["+15551110001", "+15551110002"]);
+        existing.timestamp = 200;
+        existing.last_message = "newer".into();
+        let mut partial = conversation(&["+15551110001"]);
+        partial.timestamp = 100;
+        partial.last_message = "older".into();
+        existing.merge_partial_update(&partial);
+        assert_eq!(existing.send_addresses().unwrap().len(), 2);
+        assert_eq!(existing.timestamp, 200);
+        assert_eq!(existing.last_message, "newer");
+    }
 }
 
 /// One MMS attachment on a message. Starts out with just a thumbnail
